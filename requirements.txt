@@ -1,0 +1,8 @@
+# The service and its embedded verification path use only the standard library.
+# Nothing is required to run `python3 -m certcollector --demo`.
+
+# Test suite
+pytest>=8
+
+# Optional: PostgreSQL deployment
+# psycopg[binary]>=3.1

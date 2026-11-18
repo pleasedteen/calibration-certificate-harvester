@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "certcollector"
+version = "1.0.0"
+description = "Calibration certificate collection service with simulated upstream bodies"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+test = ["pytest>=8"]
+
+[project.scripts]
+certcollector = "certcollector.__main__:main"
+certcollector-sim = "certcollector.sim_server:main"
+
+[tool.setuptools]
+packages = ["certcollector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
