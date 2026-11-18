@@ -46,11 +46,28 @@ SCHEMA = [
         finished_at TEXT,
         updated_at TEXT NOT NULL,
         heartbeat_at TEXT,
-        request_key TEXT
+        request_key TEXT,
+        source_generation BIGINT NOT NULL DEFAULT 0,
+        source_config TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_runs_org ON runs(org_id, requested_at)",
     "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(org_id, status)",
+    """
+    CREATE TABLE IF NOT EXISTS source_positions (
+        org_id TEXT NOT NULL,
+        generation BIGINT NOT NULL,
+        source_config TEXT NOT NULL,
+        watermark_cursor TEXT,
+        watermark_seq BIGINT NOT NULL DEFAULT -1,
+        head_cursor TEXT,
+        head_seq BIGINT NOT NULL DEFAULT -1,
+        cert_count INTEGER NOT NULL DEFAULT 0,
+        published_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, generation)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS scans (
         scan_id TEXT PRIMARY KEY,
@@ -67,6 +84,9 @@ SCHEMA = [
         total_hint INTEGER,
         head_seq BIGINT NOT NULL DEFAULT -1,
         head_cursor TEXT,
+        source_generation BIGINT NOT NULL DEFAULT 0,
+        source_config TEXT,
+        resume_phase TEXT,
         expires_at TEXT,
         error TEXT,
         created_at TEXT NOT NULL,
@@ -74,6 +94,26 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_scans_org ON scans(org_id, status)",
+    """
+    CREATE TABLE IF NOT EXISTS source_switches (
+        org_id TEXT PRIMARY KEY,
+        switch_id TEXT NOT NULL,
+        source_config TEXT NOT NULL,
+        base_generation BIGINT NOT NULL DEFAULT 0,
+        target_generation BIGINT NOT NULL DEFAULT 1,
+        status TEXT NOT NULL,
+        phase TEXT,
+        progress TEXT,
+        error TEXT,
+        run_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        request_key TEXT,
+        next_attempt_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS scan_items (
         scan_id TEXT NOT NULL,
@@ -98,6 +138,7 @@ SCHEMA = [
         correction_id TEXT,
         correction TEXT,
         source_seq BIGINT NOT NULL DEFAULT -1,
+        source_generation BIGINT NOT NULL DEFAULT 0,
         local_updated_at TEXT NOT NULL,
         PRIMARY KEY (org_id, cert_no)
     )
@@ -115,6 +156,7 @@ SCHEMA = [
         source_head_seq BIGINT NOT NULL DEFAULT -1,
         cert_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
+        source_generation BIGINT NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     )
     """,
@@ -328,6 +370,40 @@ class Database:
             c = self.conn()
             for ddl in SCHEMA:
                 c.execute(ddl)
+        self._migrate()
+
+    # Columns added after the first release; ``CREATE TABLE IF NOT EXISTS``
+    # does not add them to a database created by an older build.
+    _ADDED_COLUMNS = (
+        ("runs", "source_generation", "BIGINT NOT NULL DEFAULT 0"),
+        ("runs", "source_config", "TEXT"),
+        ("scans", "source_generation", "BIGINT NOT NULL DEFAULT 0"),
+        ("scans", "source_config", "TEXT"),
+        ("scans", "resume_phase", "TEXT"),
+        ("certs", "source_generation", "BIGINT NOT NULL DEFAULT 0"),
+        ("catalog_state", "source_generation", "BIGINT NOT NULL DEFAULT 0"),
+    )
+
+    def _migrate(self) -> None:
+        for table, column, ddl in self._ADDED_COLUMNS:
+            if not self._has_column(table, column):
+                try:
+                    self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                except Exception:
+                    # another process may have added it concurrently
+                    if not self._has_column(table, column):
+                        raise
+
+    def _has_column(self, table: str, column: str) -> bool:
+        if self.is_postgres:
+            row = self.query_one(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name=? AND column_name=?",
+                (table, column),
+            )
+            return row is not None
+        rows = self.query(f"PRAGMA table_info({table})")
+        return any(r["name"] == column for r in rows)
 
 
 class _SqliteTx:

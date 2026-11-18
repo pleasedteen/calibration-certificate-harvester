@@ -230,6 +230,45 @@ def run() -> int:
 
         _check("pause/resume", paused, results)
 
+        def source_switch():
+            json_world = rt.simulator.json_world
+            html_world = rt.simulator.html_world
+            before = rt.store.get_state("json-lab")
+            export = rt.store.create_export("json-lab", 4, 300)
+            html_world.update_config({"slow_ms": 5})
+            rt.engine.request_source_switch(
+                "json-lab", {"kind": "html", "base_url": "http://sim.local"}
+            )
+            served = 0
+            while True:
+                state = rt.store.get_state("json-lab")
+                assert state["ready"] is True
+                served += 1
+                if rt.store.get_source_switch("json-lab")["status"] == "succeeded":
+                    break
+                # while the new body's catalog is still incomplete the old one
+                # (and its exact content) keeps serving
+                assert state["source_generation"] == before["source_generation"]
+                assert state["cert_count"] == len(json_world.state()["certs"])
+                time.sleep(0.01)
+            html_world.update_config({"slow_ms": 0})
+            page = rt.store.export_page(export["token"], 1)
+            assert page["catalog_version"] == export["catalog_version"]
+            after = rt.store.get_state("json-lab")
+            assert after["source_generation"] == before["source_generation"] + 1
+            assert rt.store.get_org("json-lab")["source"]["kind"] == "html"
+            _wait(
+                lambda: rt.store.get_state("json-lab")["caught_up"]
+                and rt.store.get_state("json-lab")["cert_count"]
+                == len(html_world.state()["certs"])
+            )
+            assert rt.store.get_cert("json-lab", "C-1001")["data"]["model"].startswith("HTML")
+            # the previous body's position is kept independently
+            assert rt.store.get_position("json-lab", before["source_generation"]) is not None
+            return f"served {served} queries during the switch, generation {before['source_generation']} -> {after['source_generation']}"
+
+        _check("online source switch keeps queries and exports serving", source_switch, results)
+
         def crash_recovery():
             rt.engine.stop()
             rt.engine.start()

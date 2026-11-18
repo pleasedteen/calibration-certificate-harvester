@@ -110,6 +110,8 @@ rate budget.
 | `GET` | `/api/orgs/{org}` | organization + catalog state |
 | `POST` | `/api/orgs/{org}/collect` | `{"mode":"auto\|full\|incremental"}` |
 | `POST` | `/api/orgs/{org}/rebuild` | online rebuild (full) |
+| `POST` | `/api/orgs/{org}/source` | online switch to another body (`{"source":{...}}`) |
+| `GET` | `/api/orgs/{org}/source` | switch progress, phase and failure reason |
 | `POST` | `/api/orgs/{org}/pause` / `resume` | pause / resume |
 | `GET` | `/api/orgs/{org}/status` | phase, progress, wait and failure reasons |
 | `GET` | `/api/orgs/{org}/runs[/{run}]` | run history and detail |
@@ -131,6 +133,20 @@ rate budget.
   it in one transaction only after listing, detail fetching and catch-up have
   all succeeded. A failed scan never touches the published catalog, and
   certificates missing from the new snapshot leave the catalog.
+* **Online source switches.** `POST /api/orgs/{org}` with a different `source`
+  (or `POST /api/orgs/{org}/source`) moves an organization to another body
+  without stopping collection: the old body keeps its incremental lane and the
+  published catalog, queries, exports and rebuilds keep serving while the new
+  body's complete catalog is scanned. Only when listing, details and catch-up
+  all succeeded does one transaction replace the catalog, advance the read
+  position and flip the organization's source; until then
+  `GET /api/orgs/{org}/source` reports the phase, progress and failure reason.
+  Each body keeps its own position and its own revision numbering (a switch
+  back resumes that body's recorded position rather than re-reading it), and
+  results staged from a body that is no longer current are discarded — a late
+  old-body window can never leak into or resurrect content in the new catalog.
+  The intent is durable: repeated requests coalesce, and a failed or
+  interrupted switch retries and resumes automatically without resubmission.
 * **Corrections are all-or-nothing.** A formal correction that revokes an old
   certificate and publishes several replacements is only applied once every
   member is resolvable; the group (from the detail pages) is published in one

@@ -7,6 +7,8 @@ Endpoints
 ``GET    /api/orgs/{org}``                    organization detail
 ``POST   /api/orgs/{org}/collect``            start full/incremental collection
 ``POST   /api/orgs/{org}/rebuild``            start an online rebuild (full)
+``POST   /api/orgs/{org}/source``             switch to another upstream body
+``GET    /api/orgs/{org}/source``             source switch progress and failures
 ``POST   /api/orgs/{org}/pause``              pause an organization
 ``POST   /api/orgs/{org}/resume``             resume an organization
 ``GET    /api/orgs/{org}/status``             progress, wait and failure reasons
@@ -143,6 +145,13 @@ class Api:
         if action == "rebuild" and method == "POST":
             payload = body or {}
             return 202, self.engine.request_full(org_id, "rebuild", payload.get("request_key"))
+        if action == "source" and method == "POST":
+            return self._switch_source(org_id, body)
+        if action == "source" and method == "GET":
+            switch = self.store.get_source_switch(org_id)
+            if switch is None:
+                raise NotFound("no source switch recorded", details={"org_id": org_id})
+            return self._switch_status(org_id, switch)
         if action == "pause" and method == "POST":
             return self.engine.pause(org_id)
         if action == "resume" and method == "POST":
@@ -211,43 +220,81 @@ class Api:
             raise ValidationError("request body must be a JSON object")
         org_id = validate_org_id(str(body.get("org_id", "")))
         name = str(body.get("name") or org_id)
-        source = {**DEFAULT_SOURCE, **(body.get("source") or {})}
+        existing = None
+        try:
+            existing = self.store.get_org(org_id)
+        except NotFound:
+            pass
+        # A re-submission that omits settings keeps the current ones, so a plain
+        # "switch this organization to the other body" request cannot silently
+        # reset its limits or options.
+        if existing is None:
+            base_source = dict(DEFAULT_SOURCE)
+            base_limits = dict(DEFAULT_LIMITS)
+            base_options = dict(DEFAULT_OPTIONS)
+        else:
+            base_source = {**DEFAULT_SOURCE, **existing["source"]}
+            base_limits = {**DEFAULT_LIMITS, **existing["limits"]}
+            base_options = {**DEFAULT_OPTIONS, **existing["options"]}
+        source = {**base_source, **(body.get("source") or {})}
         if source.get("kind") not in ("html", "json"):
             raise ValidationError("source.kind must be html or json")
         if not source.get("base_url") or not isinstance(source["base_url"], str):
             raise ValidationError("source.base_url is required")
         if not source["base_url"].startswith(("http://", "https://")):
             raise ValidationError("source.base_url must be an http(s) URL")
-        limits = {**DEFAULT_LIMITS, **(body.get("limits") or {})}
-        options = {**DEFAULT_OPTIONS, **(body.get("options") or {})}
+        limits = {**base_limits, **(body.get("limits") or {})}
+        options = {**base_options, **(body.get("options") or {})}
         if int(limits.get("max_concurrency", 1)) < 1:
             raise ValidationError("limits.max_concurrency must be >= 1")
         if int(limits.get("max_requests_per_second", 1)) < 1:
             raise ValidationError("limits.max_requests_per_second must be >= 1")
         if float(limits.get("min_interval_ms", 0)) < 0:
             raise ValidationError("limits.min_interval_ms must be >= 0")
-        existing = None
-        try:
-            existing = self.store.get_org(org_id)
-        except NotFound:
-            pass
         if existing and body.get("reject_existing"):
             raise Conflict("organization already exists", details={"org_id": org_id})
-        org = self.store.upsert_org(org_id, name, source, limits, options)
-        self.engine.runtime(org_id)
-        self.engine._ensure_lanes(org_id)
-        if existing is None and body.get("start", True):
-            state = self.store.get_state(org_id)
-            if not state["ready"]:
-                self.engine.request_full(org_id, "initial")
-        return (201 if existing is None else 200), self._org_summary(org)
+        if existing is None:
+            org = self.store.upsert_org(org_id, name, source, limits, options)
+            self.engine.runtime(org_id)
+            self.engine._ensure_lanes(org_id)
+            if body.get("start", True):
+                state = self.store.get_state(org_id)
+                if not state["ready"]:
+                    self.engine.request_full(org_id, "initial")
+            return 201, self._org_summary(org)
+        # Updating an existing organization never stops collection: settings
+        # apply immediately, while a changed source goes through the online
+        # switch lane and the old body keeps serving until the new catalog is
+        # complete.
+        org = self.store.update_org_settings(org_id, name=name, limits=limits, options=options)
+        if self._source_signature(base_source) != self._source_signature(source):
+            switch = self.engine.request_source_switch(
+                org_id, source, request_key=body.get("request_key")
+            )
+            return 202, {
+                **self._org_summary(self.store.get_org(org_id)),
+                "switch": self._switch_status(org_id, self.store.get_source_switch(org_id)),
+                "coalesced": switch["coalesced"],
+            }
+        return 200, self._org_summary(org)
+
+    @staticmethod
+    def _source_signature(source: dict[str, Any]) -> tuple:
+        return (
+            source.get("kind"),
+            str(source.get("base_url") or "").rstrip("/"),
+            source.get("timeout"),
+            source.get("detail_url"),
+        )
 
     def _org_detail(self, org_id: str) -> dict[str, Any]:
         org = self.store.get_org(org_id)
         state = self.store.get_state(org_id)
+        switch = self.store.get_source_switch(org_id)
         return {
             **self._org_summary(org),
             "catalog": state,
+            "source_switch": self._switch_status(org_id, switch) if switch else None,
             "pending_corrections": self.store.list_pending_corrections(org_id),
         }
 
@@ -272,10 +319,14 @@ class Api:
         active = [r for r in runs if r["status"] in ("queued", "running", "paused")]
         latest = self.store.latest_scan(org_id)
         runtime = self.engine.runtime_state(org_id)
+        switch = self.store.get_source_switch(org_id)
+        switching = switch is not None and switch["status"] in ("pending", "running", "retrying")
         if not state["ready"]:
             phase = "initializing"
         elif org["paused"]:
             phase = "paused"
+        elif switching:
+            phase = "switching_source"
         elif any(r["status"] == "running" and r["kind"] == "full" for r in active):
             phase = "rebuilding"
         elif any(r["status"] == "running" for r in active):
@@ -292,12 +343,16 @@ class Api:
         for run in active:
             if run["error"]:
                 reasons.append({"scope": f"run:{run['run_id']}", **run["error"]})
+        if switch is not None and switch["error"] and switching:
+            reasons.append({"scope": "source_switch", **switch["error"]})
         return {
             "org_id": org_id,
             "phase": phase,
             "ready": state["ready"],
             "paused": org["paused"],
             "enabled": org["enabled"],
+            "source": org["source"],
+            "source_generation": state["source_generation"],
             "catalog": {
                 "version": state["version"],
                 "published_at": state["published_at"],
@@ -306,7 +361,9 @@ class Api:
                 "watermark_seq": state["watermark_seq"],
                 "source_head_seq": state["source_head_seq"],
                 "watermark_cursor": state["watermark_cursor"],
+                "source_generation": state["source_generation"],
             },
+            "source_switch": self._switch_status(org_id, switch) if switch else None,
             "scan": latest,
             "active_runs": active,
             "recent_runs": runs,
@@ -316,6 +373,54 @@ class Api:
             "pending_corrections": self.store.list_pending_corrections(org_id),
             "checked_at": iso(utcnow()),
         }
+
+    def _switch_source(self, org_id: str, body: Any) -> tuple[int, Any]:
+        if not isinstance(body, dict):
+            raise ValidationError("request body must be a JSON object")
+        source = body.get("source")
+        if not isinstance(source, dict) or not source:
+            raise ValidationError("source is required")
+        self._validate_source(source)
+        switch = self.engine.request_source_switch(
+            org_id, source, request_key=body.get("request_key")
+        )
+        return 202, {**switch, "state": self._switch_status(org_id, self.store.get_source_switch(org_id))}
+
+    @staticmethod
+    def _switch_status(org_id: str, switch: dict[str, Any] | None) -> dict[str, Any] | None:
+        if switch is None:
+            return None
+        active = switch["status"] in ("pending", "running", "retrying")
+        out = {
+            "switch_id": switch["switch_id"],
+            "status": switch["status"],
+            "phase": switch["phase"],
+            "active": active,
+            "source": switch["source"],
+            "base_generation": switch["base_generation"],
+            "target_generation": switch["target_generation"],
+            "progress": switch["progress"],
+            "error": switch["error"],
+            "failure_reason": (switch["error"] or {}).get("message")
+            if switch["status"] in ("retrying", "failed")
+            else None,
+            "attempts": switch["attempts"],
+            "run_id": switch["run_id"],
+            "next_attempt_at": switch["next_attempt_at"],
+            "created_at": switch["created_at"],
+            "updated_at": switch["updated_at"],
+            "finished_at": switch["finished_at"],
+        }
+        return out
+
+    @staticmethod
+    def _validate_source(source: dict[str, Any]) -> None:
+        if source.get("kind") not in ("html", "json"):
+            raise ValidationError("source.kind must be html or json")
+        if not source.get("base_url") or not isinstance(source["base_url"], str):
+            raise ValidationError("source.base_url is required")
+        if not source["base_url"].startswith(("http://", "https://")):
+            raise ValidationError("source.base_url must be an http(s) URL")
 
 
 def _int_query(query: dict[str, str], name: str, default: int) -> int:
