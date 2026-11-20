@@ -12,12 +12,17 @@ A few invariants are enforced here rather than in the engine:
 from __future__ import annotations
 
 import datetime as dt
+import threading
+import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .db import Database
 from .util import (
     Conflict,
+    LeaseLost,
     parse_iso,
     Gone,
     NotFound,
@@ -35,9 +40,358 @@ def _now() -> str:
     return iso(utcnow())
 
 
+@dataclass(frozen=True)
+class Lease:
+    """Ownership of one organization by one collector process.
+
+    ``epoch`` increases every time ownership changes hands and is the fencing
+    token for every write that touches that organization's task state or
+    catalog.  A process whose lease has been taken over can keep running its
+    (now useless) in-memory work, but none of its late writes can land.
+    """
+
+    org_id: str
+    owner_id: str
+    epoch: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"org_id": self.org_id, "owner_id": self.owner_id, "epoch": self.epoch}
+
+
+@dataclass(frozen=True)
+class LeaseGrant:
+    lease: Lease
+    #: True when this call created or took over the lease (as opposed to
+    #: simply renewing a lease this process already holds).
+    acquired: bool
+
+
 class Store:
     def __init__(self, db: Database):
         self.db = db
+        self._lease_local = threading.local()
+
+    # ------------------------------------------------------------------
+    # leases / write fencing
+    #
+    # Several collector processes may share one database.  Each organization is
+    # worked on by exactly one process at a time, which holds a short lease in
+    # ``org_leases``.  ``epoch`` is bumped whenever ownership changes hands and
+    # is the fencing token: every write that could alter task state or the
+    # published catalog is conditioned on the calling thread's bound lease, so
+    # a process that lost ownership (was killed, paused too long, or simply
+    # outlived its lease) cannot apply late results over the new owner's state.
+    @contextmanager
+    def fence(self, lease: "Lease | None"):
+        previous = getattr(self._lease_local, "lease", None)
+        self._lease_local.lease = lease
+        try:
+            yield lease
+        finally:
+            self._lease_local.lease = previous
+
+    def _current_lease(self) -> "Lease | None":
+        return getattr(self._lease_local, "lease", None)
+
+    def _lease_row(self, tx, org_id: str) -> dict[str, Any] | None:
+        sql = "SELECT * FROM org_leases WHERE org_id=?"
+        if self.db.is_postgres:
+            sql += " FOR UPDATE"
+        return tx.fetchone(self.db._translate(sql), (org_id,))
+
+    def _assert_lease_in_tx(
+        self, tx, org_id: str, *, row_epoch: int | None = None
+    ) -> "Lease | None":
+        lease = self._current_lease()
+        if lease is None:
+            return None
+        row = self._lease_row(tx, org_id)
+        if (
+            row is None
+            or row["owner_id"] != lease.owner_id
+            or int(row["epoch"]) != lease.epoch
+        ):
+            raise LeaseLost(
+                "organization lease is no longer held by this process",
+                details={"org_id": org_id, "epoch": lease.epoch},
+            )
+        if row_epoch is not None and int(row_epoch) != lease.epoch:
+            raise LeaseLost(
+                "row belongs to a previous owner",
+                details={"org_id": org_id, "row_epoch": int(row_epoch), "epoch": lease.epoch},
+            )
+        return lease
+
+    # Note: rows written before leases existed (or by internal callers with no
+    # bound lease) carry owner_epoch NULL.  Such rows are always claimable by
+    # the current owner; ``claim_next_run``/``create_scan`` stamp the epoch on
+    # them, after which they are fenced like any other row.
+
+    def try_acquire_lease(self, org_id: str, owner_id: str, ttl: float) -> "LeaseGrant | None":
+        """Acquire or renew ``org_id``.
+
+        Returns ``None`` when a *live* lease is held by another owner; the
+        caller must then stay passive for this organization.  An expired lease
+        is taken over with an incremented epoch.
+        """
+        now = time.time()
+        expires = now + max(0.0, float(ttl))
+        stamp = _now()
+        with self.db.transaction(write=True) as tx:
+            row = self._lease_row(tx, org_id)
+            if row is None:
+                tx.execute(
+                    self.db._translate(
+                        "INSERT INTO org_leases(org_id,owner_id,epoch,heartbeat_at,"
+                        "expires_at,updated_at) VALUES (?,?,?,?,?,?)"
+                    ),
+                    (org_id, owner_id, 1, stamp, expires, stamp),
+                )
+                return LeaseGrant(Lease(org_id, owner_id, 1), True)
+            if row["owner_id"] == owner_id:
+                if float(row["expires_at"]) > now:
+                    tx.execute(
+                        self.db._translate(
+                            "UPDATE org_leases SET heartbeat_at=?, expires_at=?, updated_at=? "
+                            "WHERE org_id=? AND owner_id=?"
+                        ),
+                        (stamp, expires, stamp, org_id, owner_id),
+                    )
+                    return LeaseGrant(Lease(org_id, owner_id, int(row["epoch"])), False)
+                # Our own lease had lapsed (e.g. this process was restarted
+                # under the same owner id).  Re-acquire it as a takeover so
+                # left-over work is reclaimed and old-epoch writes are fenced.
+                epoch = int(row["epoch"]) + 1
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE org_leases SET epoch=?, heartbeat_at=?, expires_at=?, updated_at=? "
+                        "WHERE org_id=? AND epoch=?"
+                    ),
+                    (epoch, stamp, expires, stamp, org_id, int(row["epoch"])),
+                )
+                return LeaseGrant(Lease(org_id, owner_id, epoch), True)
+            if float(row["expires_at"]) > now:
+                return None
+            epoch = int(row["epoch"]) + 1
+            tx.execute(
+                self.db._translate(
+                    "UPDATE org_leases SET owner_id=?, epoch=?, heartbeat_at=?, "
+                    "expires_at=?, updated_at=? WHERE org_id=? AND epoch=?"
+                ),
+                (owner_id, epoch, stamp, expires, stamp, org_id, int(row["epoch"])),
+            )
+            return LeaseGrant(Lease(org_id, owner_id, epoch), True)
+
+    def renew_lease(self, lease: "Lease", ttl: float) -> "Lease | None":
+        """Extend a held lease; ``None`` means it was lost to another owner."""
+        return self._lease_liveness(lease, ttl)
+
+    def _lease_liveness(self, lease: "Lease", ttl: float) -> "Lease | None":
+        now = time.time()
+        expires = now + max(0.0, float(ttl))
+        stamp = _now()
+        with self.db.transaction(write=True) as tx:
+            row = self._lease_row(tx, lease.org_id)
+            if (
+                row is None
+                or row["owner_id"] != lease.owner_id
+                or int(row["epoch"]) != lease.epoch
+            ):
+                return None
+            tx.execute(
+                self.db._translate(
+                    "UPDATE org_leases SET heartbeat_at=?, expires_at=?, updated_at=? "
+                    "WHERE org_id=? AND owner_id=? AND epoch=?"
+                ),
+                (stamp, expires, stamp, lease.org_id, lease.owner_id, lease.epoch),
+            )
+            return lease
+
+    def list_org_leases(self) -> list[dict[str, Any]]:
+        now = time.time()
+        return [
+            {
+                "org_id": r["org_id"],
+                "owner": r["owner_id"],
+                "epoch": int(r["epoch"]),
+                "heartbeat_at": r["heartbeat_at"],
+                "expires_at": r["expires_at"],
+                "live": float(r["expires_at"]) > now,
+            }
+            for r in self.db.query("SELECT * FROM org_leases ORDER BY org_id")
+        ]
+
+    def release_lease(self, lease: "Lease", *, expired: bool = True) -> None:
+        """Give up a lease so the next process can take over immediately."""
+        with self.db.transaction(write=True) as tx:
+            row = self._lease_row(tx, lease.org_id)
+            if (
+                row is None
+                or row["owner_id"] != lease.owner_id
+                or int(row["epoch"]) != lease.epoch
+            ):
+                return
+            if expired:
+                # Let any other process acquire without waiting out the TTL.
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE org_leases SET expires_at=?, updated_at=? "
+                        "WHERE org_id=? AND owner_id=? AND epoch=?"
+                    ),
+                    (0.0, _now(), lease.org_id, lease.owner_id, lease.epoch),
+                )
+            else:
+                tx.execute(
+                    self.db._translate("DELETE FROM org_leases WHERE org_id=?"), (lease.org_id,)
+                )
+
+    def reclaim_org_work(self, lease: "Lease") -> dict[str, int]:
+        """Take over work left behind by the previous owner.
+
+        Runs that were in flight are queued again; their staged scans are
+        marked interrupted so the resuming full lane starts from a fresh
+        snapshot instead of trusting half-written staging rows.  Every adopted
+        row is stamped with the new epoch, so a late write from the previous
+        owner is fenced out.
+        """
+        stamp = _now()
+        with self.db.transaction(write=True) as tx:
+            self._assert_lease_in_tx(tx, lease.org_id)
+            runs = tx.execute(
+                self.db._translate(
+                    "UPDATE runs SET status='queued', reason='resumed_after_takeover', "
+                    "owner_id=?, owner_epoch=?, updated_at=? "
+                    "WHERE org_id=? AND status IN ('running','interrupted')"
+                ),
+                (lease.owner_id, lease.epoch, stamp, lease.org_id),
+            ).rowcount
+            scans = tx.execute(
+                self.db._translate(
+                    "UPDATE scans SET status='interrupted', owner_id=?, owner_epoch=?, "
+                    "updated_at=? WHERE org_id=? AND status IN "
+                    "('listing','fetching','catching_up','interrupted') "
+                    "AND (owner_epoch IS NULL OR owner_epoch <> ?)"
+                ),
+                (lease.owner_id, lease.epoch, stamp, lease.org_id, lease.epoch),
+            ).rowcount
+        return {"runs": int(runs or 0), "scans": int(scans or 0)}
+
+    # -- shared access budget -------------------------------------------
+    def load_access(self, org_id: str) -> dict[str, float]:
+        row = self.db.query_one("SELECT * FROM org_access WHERE org_id=?", (org_id,))
+        if row is None:
+            return {
+                "next_allowed_at": 0.0,
+                "cooldown_until": 0.0,
+                "adaptive_interval": 0.0,
+                "last_request_at": 0.0,
+            }
+        return {
+            "next_allowed_at": float(row["next_allowed_at"]),
+            "cooldown_until": float(row["cooldown_until"]),
+            "adaptive_interval": float(row["adaptive_interval"]),
+            "last_request_at": float(row["last_request_at"]),
+        }
+
+    def save_access(
+        self,
+        org_id: str,
+        *,
+        next_allowed_at: float,
+        cooldown_until: float,
+        adaptive_interval: float,
+        last_request_at: float,
+    ) -> None:
+        now = _now()
+        with self.db.transaction(write=True) as tx:
+            existing = tx.fetchone(
+                self.db._translate("SELECT org_id FROM org_access WHERE org_id=?"), (org_id,)
+            )
+            if existing is None:
+                tx.execute(
+                    self.db._translate(
+                        "INSERT INTO org_access(org_id,next_allowed_at,cooldown_until,"
+                        "adaptive_interval,last_request_at,updated_at) VALUES (?,?,?,?,?,?)"
+                    ),
+                    (org_id, next_allowed_at, cooldown_until, adaptive_interval, last_request_at, now),
+                )
+            else:
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE org_access SET next_allowed_at=?, cooldown_until=?, "
+                        "adaptive_interval=?, last_request_at=?, updated_at=? WHERE org_id=?"
+                    ),
+                    (
+                        next_allowed_at,
+                        cooldown_until,
+                        adaptive_interval,
+                        last_request_at,
+                        now,
+                        org_id,
+                    ),
+                )
+
+    # -- collector process registry --------------------------------------
+    def register_collector(self, owner_id: str, ttl: float, *, pid: int | None = None,
+                           host: str | None = None) -> None:
+        now = time.time()
+        stamp = _now()
+        expires = now + max(0.0, float(ttl))
+        with self.db.transaction(write=True) as tx:
+            row = tx.fetchone(
+                self.db._translate("SELECT owner_id FROM collectors WHERE owner_id=?"), (owner_id,)
+            )
+            if row is None:
+                tx.execute(
+                    self.db._translate(
+                        "INSERT INTO collectors(owner_id,started_at,heartbeat_at,expires_at,pid,host) "
+                        "VALUES (?,?,?,?,?,?)"
+                    ),
+                    (owner_id, stamp, stamp, expires, pid, host),
+                )
+            else:
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE collectors SET heartbeat_at=?, expires_at=?, pid=?, host=? "
+                        "WHERE owner_id=?"
+                    ),
+                    (stamp, expires, pid, host, owner_id),
+                )
+
+    def heartbeat_collector(self, owner_id: str, ttl: float) -> bool:
+        expires = time.time() + max(0.0, float(ttl))
+        with self.db.transaction(write=True) as tx:
+            row = tx.execute(
+                self.db._translate(
+                    "UPDATE collectors SET heartbeat_at=?, expires_at=? WHERE owner_id=?"
+                ),
+                (_now(), expires, owner_id),
+            )
+            return bool(row.rowcount)
+
+    def unregister_collector(self, owner_id: str) -> None:
+        self.execute_checked("DELETE FROM collectors WHERE owner_id=?", (owner_id,))
+
+    def collector_alive(self, owner_id: str | None) -> bool:
+        if not owner_id:
+            return False
+        row = self.db.query_one("SELECT expires_at FROM collectors WHERE owner_id=?", (owner_id,))
+        return bool(row and float(row["expires_at"]) > time.time())
+
+    def list_collectors(self) -> list[dict[str, Any]]:
+        now = time.time()
+        return [
+            {
+                "owner_id": r["owner_id"],
+                "started_at": r["started_at"],
+                "heartbeat_at": r["heartbeat_at"],
+                "expires_at": r["expires_at"],
+                "alive": float(r["expires_at"]) > now,
+                "pid": r["pid"],
+                "host": r["host"],
+            }
+            for r in self.db.query("SELECT * FROM collectors ORDER BY owner_id")
+        ]
 
     # ------------------------------------------------------------------
     # orgs
@@ -191,6 +545,7 @@ class Store:
         if watermark_seq < 0:
             return None
         with self.db.transaction(write=True) as tx:
+            self._assert_lease_in_tx(tx, org_id)
             state = tx.fetchone(
                 self.db._translate("SELECT * FROM catalog_state WHERE org_id=?"), (org_id,)
             )
@@ -265,6 +620,7 @@ class Store:
         head_seq: int,
     ) -> dict[str, Any] | None:
         with self.db.transaction(write=True) as tx:
+            self._assert_lease_in_tx(tx, org_id)
             state = tx.fetchone(
                 self.db._translate("SELECT * FROM catalog_state WHERE org_id=?"), (org_id,)
             )
@@ -423,6 +779,8 @@ class Store:
 
     @staticmethod
     def _run_view(row: dict[str, Any]) -> dict[str, Any]:
+        owner_id = row["owner_id"] if "owner_id" in row.keys() else None
+        owner_epoch = row["owner_epoch"] if "owner_epoch" in row.keys() else None
         return {
             "run_id": row["run_id"],
             "org_id": row["org_id"],
@@ -440,6 +798,8 @@ class Store:
             "finished_at": row["finished_at"],
             "updated_at": row["updated_at"],
             "heartbeat_at": row["heartbeat_at"],
+            "owner": owner_id,
+            "owner_epoch": int(owner_epoch) if owner_epoch is not None else None,
         }
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -460,7 +820,10 @@ class Store:
 
     def claim_next_run(self, org_id: str, kinds: tuple[str, ...]) -> dict[str, Any] | None:
         placeholders = ",".join("?" for _ in kinds)
+        lease = self._current_lease()
         with self.db.transaction(write=True) as tx:
+            if lease is not None:
+                self._assert_lease_in_tx(tx, org_id)
             row = tx.fetchone(
                 self.db._translate(
                     f"SELECT * FROM runs WHERE org_id=? AND status='queued' "
@@ -474,10 +837,19 @@ class Store:
             tx.execute(
                 self.db._translate(
                     "UPDATE runs SET status='running', started_at=COALESCE(started_at,?), "
-                    "phase=?, heartbeat_at=?, updated_at=?, error=NULL, reason=NULL "
+                    "phase=?, heartbeat_at=?, updated_at=?, error=NULL, reason=NULL, "
+                    "owner_id=?, owner_epoch=? "
                     "WHERE run_id=? AND status='queued'"
                 ),
-                (now, "starting", now, now, row["run_id"]),
+                (
+                    now,
+                    "starting",
+                    now,
+                    now,
+                    lease.owner_id if lease else None,
+                    lease.epoch if lease else None,
+                    row["run_id"],
+                ),
             )
             fresh = tx.fetchone(
                 self.db._translate("SELECT * FROM runs WHERE run_id=?"), (row["run_id"],)
@@ -537,7 +909,15 @@ class Store:
             sets.append("finished_at=?")
             params.append(now)
         params.append(run_id)
+        lease = self._current_lease()
         with self.db.transaction(write=True) as tx:
+            if lease is not None:
+                row = tx.fetchone(
+                    self.db._translate("SELECT org_id, owner_epoch FROM runs WHERE run_id=?"),
+                    (run_id,),
+                )
+                if row is not None:
+                    self._assert_lease_in_tx(tx, row["org_id"], row_epoch=row["owner_epoch"])
             tx.execute(self.db._translate(f"UPDATE runs SET {','.join(sets)} WHERE run_id=?"), tuple(params))
             row = tx.fetchone(self.db._translate("SELECT * FROM runs WHERE run_id=?"), (run_id,))
             return self._run_view(row)
@@ -561,26 +941,51 @@ class Store:
         )
 
     def requeue_run(self, run_id: str, *, reason: str, status: str = "queued") -> None:
-        self.execute_checked(
-            "UPDATE runs SET status=?, reason=?, updated_at=? WHERE run_id=?", (status, reason, _now(), run_id)
-        )
+        lease = self._current_lease()
+        with self.db.transaction(write=True) as tx:
+            if lease is not None:
+                row = tx.fetchone(
+                    self.db._translate("SELECT org_id, owner_epoch FROM runs WHERE run_id=?"),
+                    (run_id,),
+                )
+                if row is not None:
+                    self._assert_lease_in_tx(tx, row["org_id"], row_epoch=row["owner_epoch"])
+            tx.execute(
+                self.db._translate(
+                    "UPDATE runs SET status=?, reason=?, updated_at=?, owner_id=NULL, "
+                    "owner_epoch=NULL WHERE run_id=?"
+                ),
+                (status, reason, _now(), run_id),
+            )
 
     def recover_runs(self) -> list[str]:
-        """Mark interrupted runs as queued so lanes resume them after a restart."""
+        """Queue runs left running by a process that no longer owns them.
+
+        Rows written by internal unit tests (no owner) are recovered as well.
+        Fenced rows owned by a live collector are deliberately left alone so
+        starting a second process cannot interrupt in-flight work; the owner's
+        lease (or the takeover path) decides when that work is requeued.
+        """
         now = _now()
+        recovered: list[str] = []
         with self.db.transaction(write=True) as tx:
             rows = tx.fetchall(
-                self.db._translate("SELECT run_id FROM runs WHERE status IN ('running','interrupted')")
+                self.db._translate(
+                    "SELECT run_id, owner_id FROM runs WHERE status IN ('running','interrupted')"
+                )
             )
             for row in rows:
+                if self.collector_alive(row["owner_id"]):
+                    continue
                 tx.execute(
                     self.db._translate(
-                        "UPDATE runs SET status='queued', reason='resumed_after_restart', updated_at=? "
-                        "WHERE run_id=?"
+                        "UPDATE runs SET status='queued', reason='resumed_after_restart', "
+                        "owner_id=NULL, owner_epoch=NULL, updated_at=? WHERE run_id=?"
                     ),
                     (now, row["run_id"]),
                 )
-            return [r["run_id"] for r in rows]
+                recovered.append(row["run_id"])
+        return recovered
 
     def pause_active_runs(self, org_id: str) -> None:
         self.execute_checked(
@@ -591,8 +996,8 @@ class Store:
 
     def resume_paused_runs(self, org_id: str) -> None:
         self.execute_checked(
-            "UPDATE runs SET status='queued', reason='resumed', updated_at=? "
-            "WHERE org_id=? AND status='paused'",
+            "UPDATE runs SET status='queued', owner_id=NULL, owner_epoch=NULL, reason='resumed', "
+            "updated_at=? WHERE org_id=? AND status='paused'",
             (_now(), org_id),
         )
 
@@ -601,19 +1006,33 @@ class Store:
     def create_scan(self, org_id: str, run_id: str, kind: str) -> dict[str, Any]:
         scan_id = uuid.uuid4().hex
         now = _now()
+        lease = self._current_lease()
         with self.db.transaction(write=True) as tx:
+            if lease is not None:
+                self._assert_lease_in_tx(tx, org_id)
             tx.execute(
                 self.db._translate(
-                    "INSERT INTO scans(scan_id,org_id,run_id,kind,status,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?)"
+                    "INSERT INTO scans(scan_id,org_id,run_id,kind,status,created_at,updated_at,"
+                    "owner_id,owner_epoch) VALUES (?,?,?,?,?,?,?,?,?)"
                 ),
-                (scan_id, org_id, run_id, kind, "listing", now, now),
+                (
+                    scan_id,
+                    org_id,
+                    run_id,
+                    kind,
+                    "listing",
+                    now,
+                    now,
+                    lease.owner_id if lease else None,
+                    lease.epoch if lease else None,
+                ),
             )
             row = tx.fetchone(self.db._translate("SELECT * FROM scans WHERE scan_id=?"), (scan_id,))
             return self._scan_view(row)
 
     @staticmethod
     def _scan_view(row: dict[str, Any]) -> dict[str, Any]:
+        keys = row.keys()
         return {
             "scan_id": row["scan_id"],
             "org_id": row["org_id"],
@@ -633,6 +1052,8 @@ class Store:
             "error": loads(row["error"]) if row["error"] else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "owner": row["owner_id"] if "owner_id" in keys else None,
+            "owner_epoch": int(row["owner_epoch"]) if "owner_epoch" in keys and row["owner_epoch"] is not None else None,
         }
 
     def get_scan(self, scan_id: str) -> dict[str, Any]:
@@ -649,11 +1070,53 @@ class Store:
         )
         return self._scan_view(row) if row else None
 
+    def drop_interrupted_scans(self, run_id: str) -> int:
+        """Remove staging rows a takeover left behind for ``run_id``."""
+        with self.db.transaction(write=True) as tx:
+            rows = tx.fetchall(
+                self.db._translate(
+                    "SELECT scan_id FROM scans WHERE run_id=? AND status='interrupted'"
+                ),
+                (run_id,),
+            )
+            for row in rows:
+                tx.execute(
+                    self.db._translate("DELETE FROM scan_items WHERE scan_id=?"), (row["scan_id"],)
+                )
+                tx.execute(
+                    self.db._translate("DELETE FROM scans WHERE scan_id=?"), (row["scan_id"],)
+                )
+            return len(rows)
+
     def latest_scan(self, org_id: str) -> dict[str, Any] | None:
         row = self.db.query_one(
             "SELECT * FROM scans WHERE org_id=? ORDER BY created_at DESC LIMIT 1", (org_id,)
         )
         return self._scan_view(row) if row else None
+
+    def _scan_org(self, scan_id: str) -> str | None:
+        row = self.db.query_one("SELECT org_id FROM scans WHERE scan_id=?", (scan_id,))
+        return row["org_id"] if row else None
+
+    def _assert_scan_owner_in_tx(self, tx, scan_id: str) -> None:
+        """Fence a staging write.
+
+        Without a bound lease this is a no-op (single-process use).  With one,
+        both the organization lease and the scan's own ``owner_epoch`` must
+        still match, so a process that lost the organization cannot keep
+        filling or deleting staging rows the new owner may already rely on.
+        """
+        lease = self._current_lease()
+        if lease is None:
+            return
+        row = tx.fetchone(
+            self.db._translate("SELECT org_id, owner_epoch FROM scans WHERE scan_id=?"),
+            (scan_id,),
+        )
+        if row is None:
+            raise LeaseLost("scan no longer exists", details={"scan_id": scan_id})
+        row_epoch = int(row["owner_epoch"]) if row["owner_epoch"] is not None else None
+        self._assert_lease_in_tx(tx, row["org_id"], row_epoch=row_epoch)
 
     def update_scan(self, scan_id: str, **fields: Any) -> dict[str, Any]:
         allowed = {
@@ -683,6 +1146,7 @@ class Store:
         params.append(_now())
         params.append(scan_id)
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             tx.execute(self.db._translate(f"UPDATE scans SET {','.join(sets)} WHERE scan_id=?"), tuple(params))
             row = tx.fetchone(self.db._translate("SELECT * FROM scans WHERE scan_id=?"), (scan_id,))
             return self._scan_view(row)
@@ -691,6 +1155,7 @@ class Store:
         if not items:
             return
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             for item in items:
                 tx.execute(
                     self.db._translate(
@@ -726,6 +1191,7 @@ class Store:
         revision: int | None = None,
     ) -> None:
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             existing = tx.fetchone(
                 self.db._translate("SELECT revision, discovered FROM scan_items WHERE scan_id=? AND cert_no=?"),
                 (scan_id, cert_no),
@@ -798,6 +1264,7 @@ class Store:
         if not cert_nos:
             return
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             tx.executemany(
                 self.db._translate(
                     "UPDATE scan_items SET status='pending' WHERE scan_id=? AND cert_no=?"
@@ -809,6 +1276,7 @@ class Store:
         if not cert_nos:
             return
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             tx.executemany(
                 self.db._translate(
                     "UPDATE scan_items SET status='pending' WHERE scan_id=? AND cert_no=? "
@@ -821,6 +1289,7 @@ class Store:
         if not cert_nos:
             return
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             tx.executemany(
                 self.db._translate(
                     "UPDATE scan_items SET status='deleted', payload='' WHERE scan_id=? AND cert_no=?"
@@ -828,19 +1297,59 @@ class Store:
                 [(scan_id, no) for no in cert_nos],
             )
 
-    def mark_interrupted_scans(self) -> None:
-        self.execute_checked(
-            "UPDATE scans SET status='interrupted' WHERE status IN ('listing','fetching','catching_up')",
-            (),
-        )
-        self.execute_checked(
-            "UPDATE runs SET status='queued', reason='resumed_after_restart' "
-            "WHERE status='running'",
-            (),
-        )
+    def mark_interrupted_scans(self, org_ids: Iterable[str] | None = None) -> None:
+        """Neutralize staging left behind by dead processes only.
+
+        Called at startup.  Scans owned by a collector that is still alive
+        (another process on the shared database) are left untouched, so a new
+        process starting up never interrupts work in progress elsewhere.  The
+        owning process's ``reclaim_org_work`` handles its own leftovers.
+        """
+        stamp = _now()
+        org_filter = list(org_ids) if org_ids is not None else None
+        with self.db.transaction(write=True) as tx:
+            scans = tx.fetchall(
+                self.db._translate(
+                    "SELECT scan_id, owner_id FROM scans WHERE status IN "
+                    "('listing','fetching','catching_up')"
+                )
+            )
+            for row in scans:
+                if self.collector_alive(row["owner_id"]):
+                    continue
+                if org_filter is not None:
+                    scan_org = tx.fetchone(
+                        self.db._translate("SELECT org_id FROM scans WHERE scan_id=?"),
+                        (row["scan_id"],),
+                    )
+                    if scan_org is None or scan_org["org_id"] not in org_filter:
+                        continue
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE scans SET status='interrupted', owner_id=NULL, owner_epoch=NULL, "
+                        "updated_at=? WHERE scan_id=?"
+                    ),
+                    (stamp, row["scan_id"]),
+                )
+            runs = tx.fetchall(
+                self.db._translate(
+                    "SELECT run_id, owner_id FROM runs WHERE status='running'"
+                )
+            )
+            for row in runs:
+                if self.collector_alive(row["owner_id"]):
+                    continue
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE runs SET status='queued', reason='resumed_after_restart', "
+                        "owner_id=NULL, owner_epoch=NULL, updated_at=? WHERE run_id=?"
+                    ),
+                    (stamp, row["run_id"]),
+                )
 
     def delete_scan(self, scan_id: str) -> None:
         with self.db.transaction(write=True) as tx:
+            self._assert_scan_owner_in_tx(tx, scan_id)
             tx.execute(self.db._translate("DELETE FROM scan_items WHERE scan_id=?"), (scan_id,))
             tx.execute(self.db._translate("DELETE FROM scans WHERE scan_id=?"), (scan_id,))
 
@@ -861,6 +1370,7 @@ class Store:
     ) -> None:
         now = _now()
         with self.db.transaction(write=True) as tx:
+            self._assert_lease_in_tx(tx, org_id)
             row = tx.fetchone(
                 self.db._translate(
                     "SELECT * FROM pending_corrections WHERE org_id=? AND correction_id=?"
@@ -922,9 +1432,16 @@ class Store:
         ]
 
     def clear_pending_correction(self, org_id: str, correction_id: str) -> None:
-        self.execute_checked(
-            "DELETE FROM pending_corrections WHERE org_id=? AND correction_id=?", (org_id, correction_id)
-        )
+        lease = self._current_lease()
+        with self.db.transaction(write=True) as tx:
+            if lease is not None:
+                self._assert_lease_in_tx(tx, org_id)
+            tx.execute(
+                self.db._translate(
+                    "DELETE FROM pending_corrections WHERE org_id=? AND correction_id=?"
+                ),
+                (org_id, correction_id),
+            )
 
     # ------------------------------------------------------------------
     # exports
@@ -1087,6 +1604,10 @@ class Store:
                     tx.execute(self.db._translate("DELETE FROM exports WHERE token=?"), (row["token"],))
                     removed["exports"] += 1
             for org_id in org_ids:
+                # Only *finished* work is pruned: a run still in flight is not
+                # in this status set, and staged scans of live work are
+                # protected by their status, so another collector sharing the
+                # database is never disturbed here.
                 finished = tx.fetchall(
                     self.db._translate(
                         "SELECT run_id FROM runs WHERE org_id=? AND status IN "
@@ -1109,8 +1630,9 @@ class Store:
                     removed["runs"] += 1
                 scans = tx.fetchall(
                     self.db._translate(
-                        "SELECT scan_id FROM scans WHERE org_id=? AND status IN ('failed','published','superseded') "
-                        "AND run_id IS NULL ORDER BY created_at DESC"
+                        "SELECT scan_id FROM scans WHERE org_id=? AND status IN "
+                        "('failed','published','superseded') AND run_id IS NULL "
+                        "ORDER BY created_at DESC"
                     ),
                     (org_id,),
                 )

@@ -79,6 +79,10 @@ class HtmlSite:
             _, _, delay = guard
             if delay:
                 time.sleep(delay)
+            # admin helpers accept POST as well (used by demos/tests that drive
+            # the simulator from another process)
+            if path.startswith("/__admin/"):
+                return self._admin(method, path, query, request.get("body"))
             if method != "GET":
                 return _json_response(405, {"error": "method_not_allowed"})
             if path == "/health":
@@ -96,8 +100,6 @@ class HtmlSite:
                 return self._detail(cert_no, query)
             if path == "/changes":
                 return self._changes(query)
-            if path.startswith("/__admin/"):
-                return self._admin(method, path, query, request.get("body"))
             return _html_response(404, "<h1>not found</h1>")
         except WorldError as exc:
             return _error(exc)
@@ -235,6 +237,8 @@ class JsonSite:
             _, _, delay = guard
             if delay:
                 time.sleep(delay)
+            if path.startswith("/__admin/"):
+                return self._admin(method, path, body=request.get("body"))
             if method != "GET":
                 return _json_response(405, {"error": "method_not_allowed"})
             if path == "/health":
@@ -250,8 +254,6 @@ class JsonSite:
                 return self._detail(cert_no, query)
             if path == "/api/v1/changes":
                 return self._changes(query)
-            if path.startswith("/__admin/"):
-                return self._admin(method, path, body=request.get("body"))
             return _json_response(404, {"error": "not_found"})
         except WorldError as exc:
             return _error(exc)

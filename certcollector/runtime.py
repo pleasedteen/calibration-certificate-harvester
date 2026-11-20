@@ -78,6 +78,9 @@ class Runtime:
         count: int = 20,
         poll_interval_ms: int = 500,
         full_retry_delay: float = 0.5,
+        owner_id: str | None = None,
+        lease_ttl: float = 3.0,
+        lease_renew_interval: float = 0.5,
     ):
         self.db_url = db_url or default_db_url()
         self.db = make_database(self.db_url)
@@ -89,6 +92,9 @@ class Runtime:
             transport_factory,
             poll_interval_ms=poll_interval_ms,
             full_retry_delay=full_retry_delay,
+            owner_id=owner_id,
+            lease_ttl=lease_ttl,
+            lease_renew_interval=lease_renew_interval,
         )
         self.api = make_api(self.store, self.engine, {"db_url": self.db_url})
         self._server: ApiServer | None = None
@@ -135,6 +141,7 @@ class Runtime:
         merged_options = {**DEFAULT_OPTIONS, **(options or {})}
         org = self.store.upsert_org(org_id, name or org_id, source, merged_limits, merged_options)
         self.engine.runtime(org_id)
+        self.engine.claim_now(org_id)
         self.engine._ensure_lanes(org_id)
         if start:
             state = self.store.get_state(org_id)

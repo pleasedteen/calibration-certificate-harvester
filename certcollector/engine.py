@@ -20,20 +20,31 @@ regress the catalog, resurrect a revoked certificate, or partially apply a
 formal correction.  Rate limits, request spacing and ``Retry-After`` are shared
 by both lanes of an organization, but each organization has its own runtime, so
 one body waiting never blocks another.
+
+Several processes may share the database.  Each organization is owned by one
+of them at a time, through a short lease (see ``Store.try_acquire_lease``);
+the lease's epoch fences every task-state and catalog write, so a process that
+lost ownership cannot apply a late result.  A process that does not own an
+organization keeps its lanes idle and waits for the lease to be released or to
+expire, which is how takeover after a crash works.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .source import ChangePage, Detail, build_adapter
-from .store import Store
+from .store import Lease, Store
 from .util import (
     ChannelExpired,
+    LeaseLost,
     NotFound,
     RateLimited,
     SourceUnavailable,
@@ -125,7 +136,12 @@ def _group_members(entry: dict[str, Any]) -> set[str]:
 
 
 class OrgRuntime:
-    """Per-organization state: adapter, pacing, wait reporting, statistics."""
+    """Per-organization state: adapter, pacing, wait reporting, statistics.
+
+    A runtime is either the *owner* of its organization (it holds a lease and
+    runs the lanes) or a *standby* (another live process owns it; this one
+    keeps a lane thread parked and takes over when the lease expires).
+    """
 
     def __init__(self, engine: "Engine", org_id: str):
         self.engine = engine
@@ -140,6 +156,12 @@ class OrgRuntime:
         self._last_request_mono = 0.0
         self._active = 0
         self._paused_cache: tuple[float, dict[str, Any]] | None = None
+        self._last_request_at = 0.0
+        self._last_access_publish = 0.0
+        self._last_access_values: tuple[float, float, float] | None = None
+        self.lease: Lease | None = None
+        self.lease_lost = threading.Event()
+        self.lease_lost_reason: str | None = None
         self.stats = {
             "requests": 0,
             "rate_limit_hits": 0,
@@ -149,6 +171,103 @@ class OrgRuntime:
             "last_request_at": None,
         }
         self.threads: dict[str, threading.Thread] = {}
+
+    # -- ownership -------------------------------------------------------
+    @property
+    def owns(self) -> bool:
+        return self.lease is not None and not self.lease_lost.is_set()
+
+    def adopt_lease(self, lease: Lease) -> None:
+        """Become the owner and inherit the previous owner's access budget."""
+        with self._lock:
+            self.lease = lease
+            self.lease_lost.clear()
+            self.lease_lost_reason = None
+        self.load_access_budget()
+
+    @property
+    def fence_lease(self) -> Lease | None:
+        """Lease to bind writes to - kept even after it is lost.
+
+        A lost lease must keep fencing late writes: with the stale epoch every
+        write to task state or the catalog is rejected instead of landing on
+        the new owner's data.
+        """
+        return self.lease
+
+    def mark_lease_lost(self, reason: str) -> None:
+        with self._lock:
+            self.lease_lost_reason = reason
+            self.lease_lost.set()
+
+    # -- shared access budget -------------------------------------------
+    def load_access_budget(self) -> None:
+        """Inherit the persisted pacing/cooldown state of this organization.
+
+        The budget is shared by both lanes and survives a hand-over: the new
+        owner must neither out-pace the body's minimum interval nor ignore a
+        ``Retry-After`` cooldown the previous owner learned.
+        """
+        try:
+            access = self.engine.store.load_access(self.org_id)
+        except Exception:  # pragma: no cover - defensive
+            return
+        now = time.time()
+        mono = time.monotonic()
+        with self._lock:
+            self._next_allowed = max(self._next_allowed, float(access["next_allowed_at"]))
+            self._cooldown_until = max(self._cooldown_until, float(access["cooldown_until"]))
+            self._adaptive_interval = max(
+                self._adaptive_interval, float(access["adaptive_interval"])
+            )
+            last = float(access["last_request_at"])
+            if last > 0:
+                self._last_request_mono = mono - max(0.0, now - last)
+                self._last_request_at = max(self._last_request_at, last)
+
+    def merge_access_budget(self) -> None:
+        """Fold another process's persisted cooldown into local pacing.
+
+        Not used on the hot path (both lanes share one runtime); the lease
+        loop calls it after a hand-over, which is when another process's
+        learned cooldown matters.
+        """
+        try:
+            access = self.engine.store.load_access(self.org_id)
+        except Exception:  # pragma: no cover - defensive
+            return
+        with self._lock:
+            self._next_allowed = max(self._next_allowed, float(access["next_allowed_at"]))
+            self._cooldown_until = max(self._cooldown_until, float(access["cooldown_until"]))
+            self._adaptive_interval = max(
+                self._adaptive_interval, float(access["adaptive_interval"])
+            )
+
+    def _publish_access_budget(self, *, force: bool = False) -> None:
+        with self._lock:
+            values = (
+                self._next_allowed,
+                self._cooldown_until,
+                self._adaptive_interval,
+                self._last_request_at,
+            )
+            now = time.monotonic()
+            if not force:
+                unchanged = self._last_access_values == values[:3]
+                if unchanged or now - self._last_access_publish < 0.5:
+                    return
+            self._last_access_publish = now
+            self._last_access_values = values[:3]
+        try:
+            self.engine.store.save_access(
+                self.org_id,
+                next_allowed_at=values[0],
+                cooldown_until=values[1],
+                adaptive_interval=values[2],
+                last_request_at=values[3],
+            )
+        except Exception:  # pragma: no cover - diagnostics only
+            log.debug("could not persist access budget for %s", self.org_id, exc_info=True)
 
     # -- org flags -------------------------------------------------------
     def org(self, force: bool = False) -> dict[str, Any]:
@@ -203,6 +322,10 @@ class OrgRuntime:
     def _check_abort(self):
         if self.engine.stop_event.is_set():
             raise RunAborted("stopped")
+        if self.lease_lost.is_set():
+            # A newer process owns this organization now; every write is
+            # fenced, so the only correct reaction is to stop quietly.
+            raise RunAborted("lease_lost")
         org = self.org()
         if not org["enabled"]:
             raise RunAborted("disabled")
@@ -221,17 +344,24 @@ class OrgRuntime:
                 if self._active < concurrency and now >= wait_until:
                     self._active += 1
                     self._next_allowed = now + interval
-                    return
+                    self._last_request_mono = time.monotonic()
+                    self._last_request_at = now
+                    break
                 if self._active >= concurrency:
                     wait = 0.02
                     if now < wait_until:
                         self.set_wait("rate_limited", wait_until - now, {"scope": "organization"})
                     else:
-                        self.set_wait("concurrency", 0.05, {"in_flight": self._active, "limit": concurrency})
+                        self.set_wait(
+                            "concurrency", 0.05, {"in_flight": self._active, "limit": concurrency}
+                        )
                 else:
                     wait = min(0.2, max(0.01, wait_until - now))
                     self.set_wait("pacing", wait, {"min_interval_ms": int(interval * 1000)})
             self.engine.stop_event.wait(wait)
+        # Publish pacing so another process taking over does not issue a
+        # request inside this spacing (throttled; Retry-After is forced).
+        self._publish_access_budget()
 
     def _release_slot(self):
         with self._lock:
@@ -259,6 +389,7 @@ class OrgRuntime:
             self._adaptive_interval = max(self._adaptive_interval, estimate, 0.01)
             self._cooldown_until = max(self._cooldown_until, now + max(required, 0.01))
             self._next_allowed = max(self._next_allowed, self._cooldown_until)
+        self._publish_access_budget(force=True)
 
     def note_success(self):
         with self._lock:
@@ -266,6 +397,7 @@ class OrgRuntime:
                 # decay slowly and keep a floor so we do not oscillate right
                 # back into the limit
                 self._adaptive_interval = max(0.005, self._adaptive_interval * 0.9 - 0.005)
+        self._publish_access_budget()
 
     def call(self, fn: Callable, *args, **kwargs):
         """Invoke a source operation honouring pacing, retries and Retry-After."""
@@ -315,17 +447,24 @@ class Engine:
         poll_interval_ms: int = 1000,
         cleanup_interval: float = 5.0,
         full_retry_delay: float = 0.2,
+        owner_id: str | None = None,
+        lease_ttl: float = 3.0,
+        lease_renew_interval: float = 0.5,
     ):
         self.store = store
         self.transport_factory = transport_factory
         self.default_poll_ms = poll_interval_ms
         self.cleanup_interval = cleanup_interval
         self.full_retry_delay = full_retry_delay
+        self.owner_id = owner_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.lease_ttl = float(lease_ttl)
+        self.lease_renew_interval = float(lease_renew_interval)
         self.stop_event = threading.Event()
         self._runtimes: dict[str, OrgRuntime] = {}
         self._lock = threading.Lock()
         self._supervisor: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
+        self._lease_thread: threading.Thread | None = None
         self._started = False
         self._last_auto: dict[str, float] = {}
         self._full_backoff: dict[str, float] = {}
@@ -339,12 +478,18 @@ class Engine:
             return
         self._started = True
         self.stop_event.clear()
+        self.store.register_collector(self.owner_id, self.lease_ttl * 3, pid=os.getpid(),
+                                      host=socket.gethostname())
+        # Only work left behind by dead processes is touched here; a live
+        # collector sharing the database keeps its in-flight organizations.
         self.store.recover_runs()
         self.store.mark_interrupted_scans()
         self._supervisor = threading.Thread(target=self._supervise, name="cc-supervisor", daemon=True)
         self._supervisor.start()
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, name="cc-cleanup", daemon=True)
         self._cleanup_thread.start()
+        self._lease_thread = threading.Thread(target=self._lease_loop, name="cc-leases", daemon=True)
+        self._lease_thread.start()
 
     def stop(self, timeout: float = 1.0) -> None:
         self.stop_event.set()
@@ -355,6 +500,20 @@ class Engine:
             self._supervisor.join(max(0.0, deadline - time.time()))
         if self._cleanup_thread:
             self._cleanup_thread.join(max(0.0, deadline - time.time()))
+        if self._lease_thread:
+            self._lease_thread.join(max(0.0, deadline - time.time()))
+        # Hand the organizations over immediately instead of making the next
+        # process wait for the TTL to expire.
+        for rt in list(self._runtimes.values()):
+            if rt.lease is not None and not rt.lease_lost.is_set():
+                try:
+                    self.store.release_lease(rt.lease)
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("could not release lease for %s", rt.org_id, exc_info=True)
+        try:
+            self.store.unregister_collector(self.owner_id)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("could not unregister collector", exc_info=True)
         self._started = False
         with self._lock:
             self._runtimes.clear()
@@ -368,6 +527,81 @@ class Engine:
     def build_adapter(self, config: dict[str, Any]):
         transport = self.transport_factory(config) if self.transport_factory else None
         return build_adapter(config, transport)
+
+    # ------------------------------------------------------------------
+    # leases
+    def _lease_loop(self) -> None:
+        """Renew held leases, acquire free ones, and detect handovers.
+
+        A process never steals a lease from a live owner: it only takes over
+        organizations whose owning process stopped renewing (exited, was
+        killed, or lost the database).  This is what makes a second process
+        harmless while the first is collecting, and what makes it take over
+        automatically once the first is gone.
+        """
+        while not self.stop_event.wait(self.lease_renew_interval):
+            try:
+                self.store.heartbeat_collector(self.owner_id, self.lease_ttl * 3)
+            except Exception:  # pragma: no cover - defensive
+                log.debug("collector heartbeat failed", exc_info=True)
+            try:
+                for org in self.store.list_orgs():
+                    self._manage_lease(org["org_id"])
+            except Exception:  # pragma: no cover - defensive
+                log.exception("lease management failed")
+
+    def _manage_lease(self, org_id: str) -> None:
+        rt = self.runtime(org_id)
+        lease = rt.lease
+        if lease is not None and not rt.lease_lost.is_set():
+            renewed = self.store.renew_lease(lease, self.lease_ttl)
+            if renewed is not None:
+                return
+            # Lost it (database row taken over): keep the stale lease bound so
+            # late writes stay fenced, but stop all work on the organization.
+            rt.mark_lease_lost("lease_expired")
+            log.warning("lost lease for %s; work stops until it is free again", org_id)
+        # A runtime that has never held a lease has no in-flight work, so any
+        # stale "running"/staged row of the organization is left over from a
+        # previous owner (or a previous incarnation of this same owner id) and
+        # must be reclaimed.
+        first_adoption = rt.lease is None
+        grant = self.store.try_acquire_lease(org_id, self.owner_id, self.lease_ttl)
+        if grant is None:
+            return
+        rt.adopt_lease(grant.lease)
+        if grant.acquired or first_adoption:
+            try:
+                reclaimed = self.store.reclaim_org_work(grant.lease)
+            except LeaseLost:  # pragma: no cover - immediate re-takeover
+                rt.mark_lease_lost("takeover_race")
+                return
+            # Pick up whatever the previous owner persisted most recently.
+            rt.merge_access_budget()
+            if reclaimed["runs"] or reclaimed["scans"]:
+                log.info(
+                    "took over %s (epoch %s): requeued %d run(s), %d scan(s)",
+                    org_id,
+                    grant.lease.epoch,
+                    reclaimed["runs"],
+                    reclaimed["scans"],
+                )
+
+    def org_owned(self, org_id: str) -> bool:
+        return self.runtime(org_id).owns
+
+    def claim_now(self, org_id: str) -> bool:
+        """Claim a free organization immediately.
+
+        Called when an organization is created *through this process*, so the
+        process that was asked to manage it wins over the peers' periodic
+        scan and the two processes end up collecting different organizations.
+        """
+        try:
+            self._manage_lease(org_id)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("immediate claim of %s failed", org_id, exc_info=True)
+        return self.org_owned(org_id)
 
     # ------------------------------------------------------------------
     # runtime / lanes
@@ -401,8 +635,15 @@ class Engine:
                 for org in orgs:
                     org_id = org["org_id"]
                     self._ensure_lanes(org_id)
+                    if not self.org_owned(org_id):
+                        # Another live process owns this organization; stay
+                        # passive so its in-flight work is not disturbed.
+                        continue
                     if org["enabled"] and not org["paused"]:
-                        self._maybe_schedule(org)
+                        with self.store.fence(self.runtime(org_id).lease):
+                            self._maybe_schedule(org)
+            except LeaseLost:
+                continue
             except Exception:  # pragma: no cover - defensive
                 log.exception("supervisor iteration failed")
             self.stop_event.wait(0.2)
@@ -446,41 +687,57 @@ class Engine:
 
     # ------------------------------------------------------------------
     # public commands
+    def _command_fence(self, org_id: str):
+        """Fence for API-triggered writes.
+
+        A command may arrive at a process that does not own the organization
+        yet (a freshly started process, or one whose lease expired just now).
+        Such a write is legitimate - it only enqueues/requeues work - but it
+        still must not disturb a live owner, so it is bound to the lease only
+        when this process holds one.
+        """
+        rt = self.runtime(org_id)
+        return self.store.fence(rt.lease if rt.owns else None)
+
     def request_full(self, org_id: str, trigger: str = "manual", request_key: str | None = None) -> dict[str, Any]:
         org = self.store.get_org(org_id)
         if not org["enabled"]:
             raise RunAborted("disabled")
-        run, coalesced = self.store.create_run(
-            org_id, FULL, trigger, request_key=request_key, coalesce_incremental=False
-        )
+        with self._command_fence(org_id):
+            run, coalesced = self.store.create_run(
+                org_id, FULL, trigger, request_key=request_key, coalesce_incremental=False
+            )
         self.runtime(org_id)
         self._ensure_lanes(org_id)
         return {**run, "coalesced": coalesced}
 
     def request_incremental(self, org_id: str, trigger: str = "manual", request_key: str | None = None) -> dict[str, Any]:
         state = self.store.get_state(org_id)
-        run, coalesced = self.store.create_run(org_id, INCREMENTAL, trigger, request_key=request_key)
-        if not state["ready"] and not coalesced:
-            self.store.finish_run(
-                run["run_id"],
-                "failed",
-                error={"code": "catalog_not_ready", "message": "a full collection must complete first"},
-            )
+        with self._command_fence(org_id):
+            run, coalesced = self.store.create_run(org_id, INCREMENTAL, trigger, request_key=request_key)
+            if not state["ready"] and not coalesced:
+                self.store.finish_run(
+                    run["run_id"],
+                    "failed",
+                    error={"code": "catalog_not_ready", "message": "a full collection must complete first"},
+                )
         self.runtime(org_id)
         self._ensure_lanes(org_id)
         return {**self.store.get_run(run["run_id"]), "coalesced": coalesced}
 
     def pause(self, org_id: str) -> dict[str, Any]:
         org = self.store.get_org(org_id)
-        self.store.set_paused(org_id, True)
-        self.store.pause_active_runs(org_id)
+        with self._command_fence(org_id):
+            self.store.set_paused(org_id, True)
+            self.store.pause_active_runs(org_id)
         rt = self.runtime(org_id)
         rt._paused_cache = (time.time(), {**org, "paused": True})
         return self.store.get_org(org_id)
 
     def resume(self, org_id: str) -> dict[str, Any]:
-        self.store.set_paused(org_id, False)
-        self.store.resume_paused_runs(org_id)
+        with self._command_fence(org_id):
+            self.store.set_paused(org_id, False)
+            self.store.resume_paused_runs(org_id)
         rt = self.runtime(org_id)
         rt._paused_cache = (time.time(), {**self.store.get_org(org_id), "paused": False})
         return self.store.get_org(org_id)
@@ -490,28 +747,50 @@ class Engine:
     def _lane_loop(self, org_id: str, kind: str) -> None:
         while not self.stop_event.is_set():
             try:
+                rt = self.runtime(org_id)
+                if not rt.owns:
+                    # Another live process owns this organization.  Keep the
+                    # thread alive but idle: the run it may be working on is
+                    # claimed under its own lease and must not be touched.
+                    rt.set_wait(None)
+                    self.stop_event.wait(0.2)
+                    continue
                 org = self.store.get_org(org_id)
                 if not org["enabled"] or org["paused"]:
                     self.stop_event.wait(0.15)
                     continue
-                run = self.store.claim_next_run(org_id, (kind,))
+                with self.store.fence(rt.fence_lease):
+                    run = self.store.claim_next_run(org_id, (kind,))
                 if run is None:
-                    self.runtime(org_id).set_wait(None)
+                    rt.set_wait(None)
                     self.stop_event.wait(0.12)
                     continue
-                rt = self.runtime(org_id)
                 try:
-                    if kind == FULL:
-                        self._run_full(rt, run)
-                    else:
-                        self._run_incremental(rt, run)
+                    with self.store.fence(rt.fence_lease):
+                        if kind == FULL:
+                            self._run_full(rt, run)
+                        else:
+                            self._run_incremental(rt, run)
                 except RunAborted as exc:
-                    self._handle_abort(run, exc.reason)
+                    self._handle_abort(rt, run, exc.reason)
+                except LeaseLost:
+                    # A newer process took over: leave its task rows alone and
+                    # let the lease loop decide when this process may resume.
+                    log.info("stopped run %s on %s: lease lost", run["run_id"], org_id)
+                    rt.mark_lease_lost("write_fenced")
                 except Exception as exc:  # pragma: no cover - defensive
                     log.exception("run %s failed", run["run_id"])
-                    self.store.finish_run(
-                        run["run_id"], "failed", error={"code": "internal_error", "message": str(exc)}
-                    )
+                    try:
+                        with self.store.fence(rt.fence_lease):
+                            self.store.finish_run(
+                                run["run_id"],
+                                "failed",
+                                error={"code": "internal_error", "message": str(exc)},
+                            )
+                    except LeaseLost:
+                        rt.mark_lease_lost("write_fenced")
+            except LeaseLost:
+                self.runtime(org_id).mark_lease_lost("write_fenced")
             except Exception:  # pragma: no cover - defensive
                 log.exception("lane loop error for %s", org_id)
                 self.stop_event.wait(0.5)
@@ -522,16 +801,29 @@ class Engine:
     def _incremental_lane(self, org_id: str) -> None:
         self._lane_loop(org_id, INCREMENTAL)
 
-    def _handle_abort(self, run: dict[str, Any], reason: str) -> None:
-        current = self.store.get_run(run["run_id"])
-        if current["status"] in ("succeeded", "failed", "cancelled", "superseded"):
+    def _handle_abort(self, rt: OrgRuntime, run: dict[str, Any], reason: str) -> None:
+        if reason == "lease_lost":
+            # Not ours any more: the task rows belong to the new owner.
             return
-        if reason == "paused":
-            self.store.requeue_run(run["run_id"], reason="organization_paused", status="paused")
-        elif reason == "disabled":
-            self.store.requeue_run(run["run_id"], reason="organization_disabled", status="paused")
-        else:
-            self.store.requeue_run(run["run_id"], reason="engine_stopped", status="queued")
+        with self.store.fence(rt.fence_lease):
+            try:
+                current = self.store.get_run(run["run_id"])
+                if current["status"] in ("succeeded", "failed", "cancelled", "superseded"):
+                    return
+                if reason == "paused":
+                    self.store.requeue_run(
+                        run["run_id"], reason="organization_paused", status="paused"
+                    )
+                elif reason == "disabled":
+                    self.store.requeue_run(
+                        run["run_id"], reason="organization_disabled", status="paused"
+                    )
+                else:
+                    self.store.requeue_run(
+                        run["run_id"], reason="engine_stopped", status="queued"
+                    )
+            except LeaseLost:
+                rt.mark_lease_lost("write_fenced")
 
     # ------------------------------------------------------------------
     # full rebuild
@@ -541,6 +833,9 @@ class Engine:
         restarts = int((run.get("progress") or {}).get("scan_restarts", 0))
         contended = int((run.get("progress") or {}).get("contention_restarts", 0))
         while True:
+            # Staging left behind by a takeover is useless (its epoch is
+            # stale); remove it before resuming so a fresh snapshot is used.
+            self.store.drop_interrupted_scans(run_id)
             scan = self.store.find_scan_for_run(run_id)
             if scan is None or scan["status"] in ("interrupted", "failed", "published"):
                 if scan is not None:

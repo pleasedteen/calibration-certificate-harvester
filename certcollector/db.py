@@ -28,6 +28,44 @@ SCHEMA = [
         updated_at TEXT NOT NULL
     )
     """,
+    # Ownership of an organization by one collector process.  The epoch is the
+    # fencing token: it advances on every change of owner, and every write that
+    # may alter task state or the published catalog is conditioned on it.
+    """
+    CREATE TABLE IF NOT EXISTS org_leases (
+        org_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        epoch BIGINT NOT NULL DEFAULT 1,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    # Shared access budget of an organization: pacing and Retry-After state is
+    # published here so a process taking over neither violates the body's
+    # minimum interval nor ignores a cooldown the previous owner learned.
+    """
+    CREATE TABLE IF NOT EXISTS org_access (
+        org_id TEXT PRIMARY KEY,
+        next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+        cooldown_until DOUBLE PRECISION NOT NULL DEFAULT 0,
+        adaptive_interval DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_request_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    # Collector processes sharing this database.  A missing or expired row
+    # means the process is gone, and its organizations are taken over.
+    """
+    CREATE TABLE IF NOT EXISTS collectors (
+        owner_id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL,
+        pid INTEGER,
+        host TEXT
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
@@ -46,7 +84,9 @@ SCHEMA = [
         finished_at TEXT,
         updated_at TEXT NOT NULL,
         heartbeat_at TEXT,
-        request_key TEXT
+        request_key TEXT,
+        owner_id TEXT,
+        owner_epoch BIGINT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_runs_org ON runs(org_id, requested_at)",
@@ -70,7 +110,9 @@ SCHEMA = [
         expires_at TEXT,
         error TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        owner_id TEXT,
+        owner_epoch BIGINT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_scans_org ON scans(org_id, status)",
@@ -160,6 +202,21 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_export_items_token ON export_items(token)",
+]
+
+# Columns added after the first release.  ``CREATE TABLE IF NOT EXISTS`` does
+# not add them to an existing database, so they are applied explicitly.
+MIGRATIONS_SQLITE = [
+    ("runs", "owner_id", "TEXT"),
+    ("runs", "owner_epoch", "BIGINT"),
+    ("scans", "owner_id", "TEXT"),
+    ("scans", "owner_epoch", "BIGINT"),
+]
+MIGRATIONS_PG = [
+    ("runs", "owner_id", "TEXT"),
+    ("runs", "owner_epoch", "BIGINT"),
+    ("scans", "owner_id", "TEXT"),
+    ("scans", "owner_epoch", "BIGINT"),
 ]
 
 
@@ -324,10 +381,16 @@ class Database:
             with self.transaction(write=True) as tx:
                 for ddl in SCHEMA:
                     tx.execute(ddl)
+            for table, column, ddl in MIGRATIONS_PG:
+                tx.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}")
         else:
             c = self.conn()
             for ddl in SCHEMA:
                 c.execute(ddl)
+            for table, column, ddl in MIGRATIONS_SQLITE:
+                existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+                if column not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 class _SqliteTx:

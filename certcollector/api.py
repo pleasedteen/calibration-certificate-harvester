@@ -20,6 +20,7 @@ Endpoints
 ``GET    /api/health``                        liveness
 ``GET    /api/admin/storage``                 storage row counts
 ``GET    /api/admin/config``                  effective runtime configuration
+``GET    /api/admin/collectors``              sharing processes + organization leases
 """
 
 from __future__ import annotations
@@ -196,6 +197,24 @@ class Api:
             return 405, {"error": "method_not_allowed"}
         if parts[0] == "storage":
             return self.store.storage_counts()
+        if parts[0] == "collectors":
+            return {
+                "self": self.engine.owner_id,
+                "items": self.store.list_collectors(),
+                "org_leases": [
+                    {
+                        **lease,
+                        "owned_here": bool(
+                            self.engine.runtime(lease["org_id"]).lease
+                            and self.engine.runtime(lease["org_id"]).lease.owner_id
+                            == self.engine.owner_id
+                            and self.engine.runtime(lease["org_id"]).lease.epoch
+                            == lease["epoch"]
+                        ),
+                    }
+                    for lease in self.store.list_org_leases()
+                ],
+            }
         if parts[0] == "config":
             return {
                 "default_source": DEFAULT_SOURCE,
@@ -235,6 +254,11 @@ class Api:
             raise Conflict("organization already exists", details={"org_id": org_id})
         org = self.store.upsert_org(org_id, name, source, limits, options)
         self.engine.runtime(org_id)
+        if existing is None:
+            # The process that was asked to create the organization takes
+            # ownership of it, so peers collecting other organizations do not
+            # steal it later.
+            self.engine.claim_now(org_id)
         self.engine._ensure_lanes(org_id)
         if existing is None and body.get("start", True):
             state = self.store.get_state(org_id)

@@ -66,6 +66,18 @@ class ChannelExpired(UpstreamError):
     code = "channel_expired"
 
 
+class LeaseLost(CertCollectorError):
+    """The caller no longer owns the organization lease.
+
+    Raised by fenced writes (runs, scans, publication).  It never reaches the
+    HTTP API; collectors catch it to stop work quietly so the new owner's state
+    is left untouched.
+    """
+
+    status = 409
+    code = "lease_lost"
+
+
 UTC = _dt.timezone.utc
 
 

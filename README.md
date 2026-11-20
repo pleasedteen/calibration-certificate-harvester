@@ -80,6 +80,44 @@ the container deployment.
 Any number of organizations can share one database: all state is keyed by
 `org_id`, and each organization's lanes and rate budget are independent.
 
+## Multiple collector processes, one database
+
+Several collector processes may serve the same database at once, for example
+one per region with each collecting a different set of organizations:
+
+```bash
+python3 -m certcollector --port 8000 --database-url /data/certs.db
+python3 -m certcollector --port 8001 --database-url /data/certs.db
+```
+
+Coordination uses a short lease per organization (`org_leases`), not process
+ownership of the whole database:
+
+* **One owner per organization.** A process renews its leases continuously; a
+  second process stays passive for organizations it does not own, so starting
+  it never interrupts work already running elsewhere. New organizations are
+  claimed by the process that created them.
+* **Both lanes still run in parallel.** A full rebuild and an incremental
+  catch-up of the same organization run in two independent lanes of its owner.
+* **Automatic takeover.** If the owner exits or dies, its lease expires (or is
+  released on clean shutdown) and the surviving process adopts the
+  organization, requeues its interrupted runs and starts a fresh, consistent
+  scan. Database work left by a dead process is recovered; work owned by a live
+  process is left untouched at startup.
+* **Late results cannot land.** The lease carries a monotonically increasing
+  epoch, and every write to task state, staged scans or the published catalog
+  is conditional on the writer's epoch. A process that lost ownership - however
+  late its in-flight result arrives - is rejected (`lease_lost`) instead of
+  overwriting the new owner's runs, scans or catalog.
+* **Access limits survive the hand-over.** Concurrency, minimum request spacing
+  and learned `Retry-After` pacing are persisted per organization
+  (`org_access`), so a takeover neither floods the body nor ignores a cooldown
+  the previous owner observed.
+
+`GET /api/admin/collectors` lists the registered processes (liveness, pid) and
+the current organization leases. It is diagnostic only; coordination never
+depends on an HTTP call between processes.
+
 ## Configuration
 
 Organization payload (`POST /api/orgs`):
@@ -119,7 +157,7 @@ rate budget.
 | `POST` | `/api/orgs/{org}/exports` | `{"page_size":n,"ttl_seconds":s}` |
 | `GET` | `/api/exports/{token}` | export metadata |
 | `GET` | `/api/exports/{token}/pages/{page}` | one frozen-catalog page |
-| `GET` | `/api/health`, `/api/admin/storage`, `/api/admin/config` | diagnostics |
+| `GET` | `/api/health`, `/api/admin/storage`, `/api/admin/config`, `/api/admin/collectors` | diagnostics |
 
 ## Behavioural guarantees
 
@@ -152,6 +190,11 @@ rate budget.
 * **Crash safe.** Runs are durable; after a forced kill and restart the service
   resumes interrupted work, tolerates repeated requests, and converges to the
   same catalog as an uninterrupted run.
+* **Safe to run more than once.** Several processes may share one database;
+  each organization is owned by one process at a time through a fenced lease,
+  so starting another process never interrupts running work, a dead process is
+  replaced automatically, and late results from a previous owner are rejected
+  rather than applied.
 * **Respectful to sources.** Per-organization concurrency, request spacing and
   `Retry-After` are obeyed (the collector also adapts its pacing when it is
   throttled). Waiting for one body never blocks another, and `status` reports
@@ -166,7 +209,12 @@ python3 -m pytest -q
 
 The suite runs entirely against the built-in simulators (embedded SQLite) and
 covers corrections, online rebuilds, history expiry, export resumption, access
-limits and forced-kill recovery. It finishes well under 80 seconds.
+limits, forced-kill recovery and multi-process sharing. The multi-process tests
+start real collector processes against one SQLite file plus a standalone
+simulator process; they exercise parallel collection of different
+organizations, a passive second process, full/incremental lanes running
+together, graceful and hard-kill takeover, cross-process access limits and
+fencing of late writes. It finishes well under 90 seconds.
 
 ## Embedded self-check (no pytest needed)
 
