@@ -126,11 +126,16 @@ rate budget.
 * **Not ready before the first catalog.** Until the initial full scan finishes
   and is published, `status.ready` is `false` and certificate queries return an
   empty catalog.
-* **Rebuilds are online.** The previously published catalog (and the
-  incremental channel) keep serving during a rebuild; the new catalog replaces
-  it in one transaction only after listing, detail fetching and catch-up have
-  all succeeded. A failed scan never touches the published catalog, and
-  certificates missing from the new snapshot leave the catalog.
+* **Rebuilds are online and scale with the change set.** The previously
+  published catalog (and the incremental channel) keep serving during a
+  rebuild; the new catalog replaces it in one transaction only after listing,
+  detail fetching and catch-up have all succeeded. A failed scan never touches
+  the published catalog, and certificates missing from the new snapshot leave
+  the catalog. Staged details are streamed out of the staging area in bounded
+  chunks of 2,000 entries rather than read back into memory as one batch, and
+  the swap transaction only upserts rows whose content changed and deletes
+  rows that vanished from the source, so its peak memory and write footprint
+  grow with the number of pending merges, not with the directory size.
 * **Corrections are all-or-nothing.** A formal correction that revokes an old
   certificate and publishes several replacements is only applied once every
   member is resolvable; the group (from the detail pages) is published in one
@@ -167,6 +172,27 @@ python3 -m pytest -q
 The suite runs entirely against the built-in simulators (embedded SQLite) and
 covers corrections, online rebuilds, history expiry, export resumption, access
 limits and forced-kill recovery. It finishes well under 80 seconds.
+
+The large-directory rebuild tests (`test_08_*`, `test_09_*`) build local
+fixtures of 2,000 and 20,000 equal-sized certificate details and pin the
+streaming properties directly: bounded publication peak memory across the two
+scales, swap transactions whose row writes only cover the pending change set,
+concurrent incremental updates while a rebuild prepares, a mid-rebuild engine
+restart that converges, source removals leaving the catalog and old exports
+remaining readable across the switch.
+
+## Scale benchmark
+
+A dependency-free benchmark reproduces the old whole-batch publication inline
+and compares it against the streaming swap on local SQLite fixtures:
+
+```bash
+python3 -I benchmarks/rebuild_scale_benchmark.py
+```
+
+It reports peak swap memory, lock-hold time and rows written at the 2,000 and
+20,000 certificate scales, for both an unchanged directory and one with a
+small pending delta.
 
 ## Embedded self-check (no pytest needed)
 

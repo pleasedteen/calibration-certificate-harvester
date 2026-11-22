@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from typing import Any, Iterable
+from bisect import bisect_left
+from typing import Any, Iterable, Iterator
 
 from .db import Database
 from .util import (
@@ -29,6 +30,13 @@ from .util import (
 
 RUN_ACTIVE = ("queued", "running", "paused", "interrupted")
 RUN_FINISHED = ("succeeded", "failed", "superseded", "cancelled")
+
+# A full rebuild streams its staged details out of ``scan_items`` in chunks of
+# this many entries instead of materializing the whole catalog at once.  At
+# 20k equal-sized details the collector never holds more than two chunks of
+# rows at the same time, so the collection-side peak memory stays within a
+# small constant factor of the 2k-batch baseline rather than growing tenfold.
+PUBLISH_CHUNK_SIZE = 2000
 
 
 def _now() -> str:
@@ -172,10 +180,78 @@ class Store:
         "OR (excluded.revision = certs.revision AND certs.status <> 'revoked')"
     )
 
-    def publish_full(
+    # Columns that define the content of a certificate row; the rebuild only
+    # writes a staged row when one of these differs from what is published.
+    _CERT_CONTENT_COLUMNS = (
+        "revision",
+        "status",
+        "payload",
+        "source_updated_at",
+        "revoked_at",
+        "correction_id",
+        "correction",
+    )
+
+    def iter_scan_entries(
+        self, scan_id: str, chunk_size: int = PUBLISH_CHUNK_SIZE
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield staged, still-visible scan entries in bounded-size chunks.
+
+        Rows marked ``deleted`` (the source no longer resolves the number) and
+        rows that never received a payload never enter the published catalog;
+        they are simply skipped here.
+        """
+        offset = 0
+        while True:
+            rows = self.db.query(
+                "SELECT cert_no, revision, status, payload FROM scan_items "
+                "WHERE scan_id=? AND status <> 'deleted' AND payload <> '' "
+                "ORDER BY ordinal, cert_no LIMIT ? OFFSET ?",
+                (scan_id, int(chunk_size), offset),
+            )
+            if not rows:
+                return
+            yield [
+                {
+                    "cert_no": r["cert_no"],
+                    "revision": int(r["revision"]),
+                    "status": r["status"],
+                    **(loads(r["payload"], {}) or {}),
+                }
+                for r in rows
+            ]
+            offset += len(rows)
+            if len(rows) < int(chunk_size):
+                return
+
+    def scan_entries_for_certs(
+        self, scan_id: str, cert_nos: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch specific staged entries (e.g. correction group members)."""
+        wanted = sorted(set(cert_nos))
+        entries: dict[str, dict[str, Any]] = {}
+        for idx in range(0, len(wanted), PUBLISH_CHUNK_SIZE):
+            batch = wanted[idx : idx + PUBLISH_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.db.query(
+                f"SELECT cert_no, revision, status, payload FROM scan_items "
+                f"WHERE scan_id=? AND status <> 'deleted' AND payload <> '' "
+                f"AND cert_no IN ({placeholders})",
+                (scan_id, *batch),
+            )
+            for r in rows:
+                entries[r["cert_no"]] = {
+                    "cert_no": r["cert_no"],
+                    "revision": int(r["revision"]),
+                    "status": r["status"],
+                    **(loads(r["payload"], {}) or {}),
+                }
+        return entries
+
+    def publish_full_from_scan(
         self,
         org_id: str,
-        entries: list[dict[str, Any]],
+        scan_id: str,
         *,
         watermark_cursor: str | None,
         watermark_seq: int,
@@ -183,49 +259,124 @@ class Store:
         head_seq: int,
         run_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically replace the published catalog.
+        """Atomically replace the published catalog from a staged scan.
+
+        The staged catalog is streamed out of ``scan_items`` one chunk at a
+        time, so the process never holds the whole directory in memory.
+        Inside the single swap transaction only rows whose content actually
+        changed are upserted, and only certificates that vanished from the
+        source (and were not refreshed by a newer incremental window) are
+        deleted; its write footprint therefore grows with the number of
+        pending changes, not with the directory's total size.
 
         Returns ``None`` when the swap would move the watermark backwards; in
         that case nothing is written and the caller must catch up first.
         """
         if watermark_seq < 0:
             return None
+        wm = int(watermark_seq)
+        changed_rows: list[tuple] = []
         with self.db.transaction(write=True) as tx:
             state = tx.fetchone(
                 self.db._translate("SELECT * FROM catalog_state WHERE org_id=?"), (org_id,)
             )
             if state is None:
                 raise NotFound("catalog state not found")
-            if int(watermark_seq) < int(state["watermark_seq"]):
+            if wm < int(state["watermark_seq"]):
                 return None
-            # Rows not in the snapshot must leave the catalog, but the delete is
-            # expressed after the upserts so the monotonic guard above decides
-            # which version of a shared number survives.
-            snapshot_nos = {e["cert_no"] for e in entries}
-            existing = {
-                r["cert_no"]: int(r["source_seq"])
+            # Published certificate numbers in a single ordered list plus a
+            # one-bit-per-row "still present" marker.  This is O(N) bytes
+            # instead of O(N) Python objects, and the row content itself is
+            # re-read per scan chunk: no side of the comparison ever
+            # materializes the whole directory.
+            existing_nos = [
+                r["cert_no"]
                 for r in tx.fetchall(
-                    self.db._translate("SELECT cert_no, source_seq FROM certs WHERE org_id=?"),
+                    self.db._translate(
+                        "SELECT cert_no FROM certs WHERE org_id=? ORDER BY cert_no"
+                    ),
                     (org_id,),
                 )
-            }
-            rows = [self._cert_row_tuple(org_id, e, watermark_seq) for e in entries]
-            if rows:
-                tx.executemany(self.db._translate(self.CERT_INSERT), rows)
-            # A row written by a newer incremental window (source_seq beyond the
-            # snapshot's position) is current and must not be dropped by a
-            # rebuild that has not seen it yet.
-            stale = sorted(
-                no
-                for no, seq in existing.items()
-                if no not in snapshot_nos and seq <= int(watermark_seq)
-            )
+            ]
+            present_marker = bytearray((len(existing_nos) + 7) // 8)
+            for index in range(len(existing_nos)):
+                present_marker[index >> 3] |= 1 << (index & 7)
+
+            def mark_present(cert_no: str) -> None:
+                # cert_no ordering matches on both sides (ORDER BY cert_no), so
+                # a bisect locates the row without a hash table of N strings.
+                position = bisect_left(existing_nos, cert_no)
+                if position < len(existing_nos) and existing_nos[position] == cert_no:
+                    present_marker[position >> 3] &= ~(1 << (position & 7))
+
+            # Stream the staged catalog in bounded chunks instead of reading
+            # every detail back into memory at once.
+            offset = 0
+            while True:
+                rows = tx.fetchall(
+                    self.db._translate(
+                        "SELECT cert_no, revision, status, payload FROM scan_items "
+                        "WHERE scan_id=? AND status <> 'deleted' AND payload <> '' "
+                        "ORDER BY ordinal, cert_no LIMIT ? OFFSET ?"
+                    ),
+                    (scan_id, PUBLISH_CHUNK_SIZE, offset),
+                )
+                if not rows:
+                    break
+                batch_nos = [r["cert_no"] for r in rows]
+                placeholders = ",".join("?" for _ in batch_nos)
+                current_rows = tx.fetchall(
+                    self.db._translate(
+                        "SELECT cert_no, source_seq, revision, status, payload, "
+                        "source_updated_at, revoked_at, correction_id, correction "
+                        f"FROM certs WHERE org_id=? AND cert_no IN ({placeholders})"
+                    ),
+                    (org_id, *batch_nos),
+                )
+                current_by_no = {r["cert_no"]: r for r in current_rows}
+                for row in rows:
+                    cert_no = row["cert_no"]
+                    mark_present(cert_no)
+                    entry = {
+                        "cert_no": cert_no,
+                        "revision": int(row["revision"]),
+                        "status": row["status"],
+                        **(loads(row["payload"], {}) or {}),
+                    }
+                    current = current_by_no.get(cert_no)
+                    if current is not None and not self._row_diffs(current, entry):
+                        # Identical content: leave the published row (and its
+                        # source_seq) untouched so the swap writes only changes.
+                        continue
+                    changed_rows.append(self._cert_row_tuple(org_id, entry, wm))
+                offset += len(rows)
+                if len(rows) < PUBLISH_CHUNK_SIZE:
+                    break
+            if changed_rows:
+                tx.executemany(self.db._translate(self.CERT_INSERT), changed_rows)
+            # Numbers still marked vanished from the snapshot.  A row written by
+            # a newer incremental window (source_seq beyond the snapshot's
+            # position) is current and must not be dropped; that check runs
+            # inside the database, in bounded batches.
+            stale_candidates = [
+                existing_nos[index]
+                for index in range(len(existing_nos))
+                if (present_marker[index >> 3] >> (index & 7)) & 1
+            ]
+            stale = self._stale_numbers_to_delete(tx, org_id, stale_candidates, wm)
             if stale:
-                tx.executemany(
-                    self.db._translate("DELETE FROM certs WHERE org_id=? AND cert_no=?"),
-                    [(org_id, no) for no in stale],
+                placeholders = ",".join("?" for _ in stale)
+                tx.execute(
+                    self.db._translate(
+                        f"DELETE FROM certs WHERE org_id=? AND cert_no IN ({placeholders})"
+                    ),
+                    (org_id, *stale),
                 )
             now = _now()
+            count_row = tx.fetchone(
+                self.db._translate("SELECT COUNT(*) AS n FROM certs WHERE org_id=?"), (org_id,)
+            )
+            cert_count = int(count_row["n"])
             version = int(state["version"]) + 1
             tx.execute(
                 self.db._translate(
@@ -238,20 +389,61 @@ class Store:
                     version,
                     now,
                     watermark_cursor,
-                    int(watermark_seq),
+                    wm,
                     head_cursor,
                     int(head_seq),
-                    len(entries),
+                    cert_count,
                     now,
                     org_id,
                 ),
             )
-            return {
-                "version": version,
-                "published_at": now,
-                "cert_count": len(entries),
-                "watermark_seq": int(watermark_seq),
-            }
+        return {
+            "version": version,
+            "published_at": now,
+            "cert_count": cert_count,
+            "watermark_seq": wm,
+            "changed_rows": len(changed_rows),
+            "deleted_rows": len(stale),
+        }
+
+    def _stale_numbers_to_delete(
+        self, tx, org_id: str, candidates: list[str], watermark_seq: int
+    ) -> list[str]:
+        """Vanished numbers whose surviving row is not newer than the snapshot.
+
+        The source_seq check is done inside the database so the full content
+        rows never need to be materialized in Python."""
+        if not candidates:
+            return []
+        stale: list[str] = []
+        wanted = sorted(candidates)
+        for idx in range(0, len(wanted), PUBLISH_CHUNK_SIZE):
+            batch = wanted[idx : idx + PUBLISH_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = tx.fetchall(
+                self.db._translate(
+                    f"SELECT cert_no FROM certs WHERE org_id=? AND source_seq <= ? "
+                    f"AND cert_no IN ({placeholders})"
+                ),
+                (org_id, int(watermark_seq), *batch),
+            )
+            stale.extend(r["cert_no"] for r in rows)
+        return sorted(stale)
+
+    @classmethod
+    def _row_diffs(cls, current: dict[str, Any], entry: dict[str, Any]) -> bool:
+        """True when a staged entry differs from the published certificate."""
+        staged = (
+            int(entry["revision"]),
+            entry["status"],
+            dumps(entry.get("data") or {}),
+            entry.get("source_updated_at"),
+            entry.get("revoked_at"),
+            entry.get("correction_id"),
+            dumps(entry.get("correction")) if entry.get("correction") else None,
+        )
+        present = tuple(current[column] for column in cls._CERT_CONTENT_COLUMNS)
+        return staged != present
 
     def publish_incremental(
         self,
@@ -778,6 +970,47 @@ class Store:
                 }
             )
         return out
+
+    def scan_correction_groups(self, scan_id: str) -> list[dict[str, Any]]:
+        """Return the (cert_no, correction_id, correction JSON) of staged rows
+        that belong to a formal correction.  The query only touches the small
+        subset of entries carrying a correction, so validating groups before a
+        swap never reads the whole catalog into memory."""
+        rows = self.db.query(
+            # ``dumps`` emits compact, sorted JSON (``"correction_id":"..."``),
+            # so the LIKE predicate keeps null ids ("correction_id":null) out.
+            "SELECT cert_no, payload FROM scan_items "
+            "WHERE scan_id=? AND status <> 'deleted' AND payload <> '' "
+            "AND payload LIKE '%\"correction_id\":\"%' "
+            "ORDER BY ordinal, cert_no",
+            (scan_id,),
+        )
+        groups = []
+        for row in rows:
+            payload = loads(row["payload"], default=None)
+            if not isinstance(payload, dict):
+                continue
+            correction_id = payload.get("correction_id")
+            if not correction_id:
+                continue
+            groups.append(
+                {
+                    "cert_no": row["cert_no"],
+                    "correction_id": correction_id,
+                    "correction": payload.get("correction"),
+                }
+            )
+        return groups
+
+    def bulk_upsert_certs(
+        self, org_id: str, entries: list[dict[str, Any]], source_seq: int = -1
+    ) -> None:
+        """Fast bulk load of published certificate rows (fixtures/benchmarks)."""
+        if not entries:
+            return
+        rows = [self._cert_row_tuple(org_id, entry, source_seq) for entry in entries]
+        with self.db.transaction(write=True) as tx:
+            tx.executemany(self.db._translate(self.CERT_INSERT), rows)
 
     def scan_item_counts(self, scan_id: str) -> dict[str, int]:
         rows = self.db.query(

@@ -175,6 +175,10 @@ class Database:
         self._write_lock = threading.RLock()
         self._local = threading.local()
         self._closed = False
+        # Optional diagnostics: when a list is assigned here every SQL
+        # statement executed inside a write transaction is recorded as
+        # (verb, normalized-sql, rowcount).  Off by default.
+        self.sql_trace: list[tuple[str, str, int]] | None = None
         if self.is_postgres:
             try:
                 import psycopg  # type: ignore
@@ -295,7 +299,7 @@ class Database:
             with self._write_lock:
                 c.execute("BEGIN IMMEDIATE")
                 try:
-                    yield _SqliteTx(c)
+                    yield _SqliteTx(c, self.sql_trace)
                     c.execute("COMMIT")
                 except BaseException:
                     try:
@@ -306,7 +310,7 @@ class Database:
         else:
             c.execute("BEGIN")
             try:
-                yield _SqliteTx(c)
+                yield _SqliteTx(c, None)
                 c.execute("COMMIT")
             except BaseException:
                 try:
@@ -331,14 +335,27 @@ class Database:
 
 
 class _SqliteTx:
-    def __init__(self, conn):
+    def __init__(self, conn, trace=None):
         self.conn = conn
+        self._trace = trace
+
+    def _record(self, sql: str, rowcount: int) -> None:
+        if self._trace is None:
+            return
+        head = sql.lstrip().split(None, 1)
+        verb = head[0].upper() if head else "OTHER"
+        self._trace.append((verb, " ".join(sql.split()), max(0, int(rowcount))))
 
     def execute(self, sql: str, params: tuple = ()):
-        return self.conn.execute(sql, params)
+        cur = self.conn.execute(sql, params)
+        self._record(sql, cur.rowcount if cur.rowcount is not None else 0)
+        return cur
 
     def executemany(self, sql: str, rows):
-        return self.conn.executemany(sql, rows)
+        cur = self.conn.executemany(sql, rows)
+        # sqlite reports the cumulative rowcount of the batch
+        self._record(sql, cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+        return cur
 
     def fetchall(self, sql: str, params: tuple = ()):
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]

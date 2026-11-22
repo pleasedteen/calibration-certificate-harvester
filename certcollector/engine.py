@@ -727,13 +727,16 @@ class Engine:
             rt._check_abort()
             self._catch_up_scan(rt, run, scan)
             scan = self.store.get_scan(scan_id)
-            entries = self._assemble_staged(rt, run, scan)
+            # Correction consistency is checked against only the certs that
+            # participate in a correction; the rest of the catalog stays on
+            # disk in scan_items and is streamed into the swap transaction.
+            self._validate_staged_corrections(rt, run, scan)
             watermark_seq = scan["head_seq"]
             if watermark_seq < 0:
                 raise ScanExpired("no continuation position read")
-            published = self.store.publish_full(
+            published = self.store.publish_full_from_scan(
                 org_id,
-                list(entries.values()),
+                scan_id,
                 watermark_cursor=scan["head_cursor"] or scan["catchup_cursor"],
                 watermark_seq=watermark_seq,
                 head_cursor=scan["head_cursor"],
@@ -750,6 +753,8 @@ class Engine:
                         "scan_restarts": attempt,
                         "published_version": published["version"],
                         "cert_count": published["cert_count"],
+                        "changed_rows": published["changed_rows"],
+                        "deleted_rows": published["deleted_rows"],
                     },
                 )
                 self.store.finish_run(
@@ -838,23 +843,34 @@ class Engine:
             return present, gone
         return None
 
-    def _assemble_staged(
+    def _validate_staged_corrections(
         self, rt: OrgRuntime, run: dict[str, Any], scan: dict[str, Any]
-    ) -> dict[str, dict[str, Any]]:
+    ) -> None:
+        """Make sure every staged correction group is complete before swapping.
+
+        Unlike the catalog swap itself this never materializes the whole
+        directory: only the members of formal corrections are pulled out of
+        ``scan_items`` (they are a small, bounded set), refetched when stale,
+        and the scan fails explicitly if a group cannot become consistent.
+        """
         scan_id = scan["scan_id"]
         for _ in range(4):
             rt._check_abort()
-            items = self.store.scan_items(scan_id)
-            entries: dict[str, dict[str, Any]] = {}
-            for item in items:
-                if item["status"] == "deleted" or not item["payload"]:
-                    continue
-                entries[item["cert_no"]] = item["payload"]
+            # First pass: only correction ids and their declared membership are
+            # needed, and those live in the small correction JSON column.
+            group_rows = self.store.scan_correction_groups(scan_id)
+            if not group_rows:
+                return
             groups: dict[str, set[str]] = {}
-            for no, entry in entries.items():
-                key = _entry_group_key(entry)
-                if key:
-                    groups.setdefault(key, set()).update(_group_members(entry))
+            for row in group_rows:
+                key = row["correction_id"]
+                groups.setdefault(key, set()).add(row["cert_no"])
+                correction = row["correction"]
+                if isinstance(correction, dict):
+                    groups[key].update(correction.get("members") or [])
+                    groups[key].update(correction.get("supersedes") or [])
+            wanted = {no for members in groups.values() for no in members}
+            entries = self.store.scan_entries_for_certs(scan_id, wanted)
             missing_fetch: set[str] = set()
             incomplete: list[str] = []
             for cid, members in groups.items():
@@ -887,8 +903,7 @@ class Engine:
                 if refresh and self._stage_details_visible(rt, scan_id, refresh):
                     continue
                 raise IncompleteCorrection(incomplete[0], {"incomplete": incomplete})
-            # drop correction members that are not published (deleted upstream)
-            return entries
+            return
         raise IncompleteCorrection("unknown", {"reason": "group never became consistent"})
 
     def _stage_details_visible(self, rt: OrgRuntime, scan_id: str, cert_nos: set[str]) -> bool:
