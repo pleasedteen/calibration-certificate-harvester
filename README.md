@@ -116,6 +116,7 @@ rate budget.
 | `GET` | `/api/orgs/{org}/certs?page=&page_size=&status=` | paged certificates |
 | `GET` | `/api/orgs/{org}/certs/{cert}` | certificate detail (incl. correction) |
 | `GET` | `/api/orgs/{org}/corrections` | corrections not yet fully applied |
+| `GET` | `/api/orgs/{org}/pending-reads` | listed certificates whose detail page is temporarily 404 |
 | `POST` | `/api/orgs/{org}/exports` | `{"page_size":n,"ttl_seconds":s}` |
 | `GET` | `/api/exports/{token}` | export metadata |
 | `GET` | `/api/exports/{token}/pages/{page}` | one frozen-catalog page |
@@ -136,6 +137,21 @@ rate budget.
   member is resolvable; the group (from the detail pages) is published in one
   transaction, so a query can never observe the old revoked with only part of
   the replacements present.
+* **Re-corrections roll forward.** When a formal correction is itself formally
+  corrected again, members whose current correction id points at the newer
+  group (which supersedes the old one) are accepted as consistent.  Neither the
+  incremental channel nor a full rebuild gets stuck on or fails a re-correction
+  chain; both eventually publish the complete current catalog.
+* **Listed-but-unreadable members wait, everything else flows.** If the
+  directory still lists a member but its detail page temporarily returns 404,
+  the affected correction (or ordinary revision) is held in durable
+  `pending_reads` / `pending_corrections` state and retried with bounded
+  backoff; unrelated revisions in the same change window still publish, the
+  watermark keeps advancing, and `status` reports the pending work.  A rebuild
+  in this state keeps the previous catalog serving and retries instead of
+  failing.  Once the member is readable again — or confirmed removed from the
+  directory (purged) — the held work converges automatically, including after a
+  restart or when the snapshot/cursor had expired.
 * **Monotonic catch-up.** Published watermarks only move forward, so neither a
   rebuild nor a late incremental window can regress the catalog or resurrect a
   revoked certificate. Once caught up, the stored catalog equals the source.

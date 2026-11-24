@@ -178,6 +178,8 @@ class Api:
             return 201, self.store.create_export(org_id, page_size, ttl)
         if action == "corrections" and method == "GET":
             return {"items": self.store.list_pending_corrections(org_id)}
+        if action == "pending-reads" and method == "GET":
+            return {"items": self.store.list_pending_reads(org_id)}
         return 404, {"error": "not_found"}
 
     def _exports(self, method: str, parts: list[str], query: dict[str, str]):  # noqa: ARG002
@@ -249,6 +251,7 @@ class Api:
             **self._org_summary(org),
             "catalog": state,
             "pending_corrections": self.store.list_pending_corrections(org_id),
+            "pending_reads": self.store.list_pending_reads(org_id),
         }
 
     @staticmethod
@@ -272,6 +275,8 @@ class Api:
         active = [r for r in runs if r["status"] in ("queued", "running", "paused")]
         latest = self.store.latest_scan(org_id)
         runtime = self.engine.runtime_state(org_id)
+        pending_corrections = self.store.list_pending_corrections(org_id)
+        pending_reads = self.store.list_pending_reads(org_id)
         if not state["ready"]:
             phase = "initializing"
         elif org["paused"]:
@@ -284,6 +289,10 @@ class Api:
             phase = "scheduled"
         else:
             phase = "ready" if state["caught_up"] else "idle"
+        # A full run staged against a source with a temporarily unreadable
+        # member is deliberately waiting, not idle.
+        if any(r.get("phase") == "awaiting_correction" for r in active):
+            phase = "awaiting_correction"
         reasons = []
         if state["last_error"]:
             reasons.append({"scope": "catalog", **state["last_error"]})
@@ -292,12 +301,35 @@ class Api:
         for run in active:
             if run["error"]:
                 reasons.append({"scope": f"run:{run['run_id']}", **run["error"]})
+        for item in pending_corrections:
+            reasons.append(
+                {
+                    "scope": "correction",
+                    "correction_id": item["correction_id"],
+                    "reason": "correction_pending",
+                    "message": (item.get("last_error") or {}).get(
+                        "message", "a formal correction is waiting for its members"
+                    ),
+                    "attempts": item["attempts"],
+                }
+            )
+        for item in pending_reads:
+            reasons.append(
+                {
+                    "scope": "detail",
+                    "cert_no": item["cert_no"],
+                    "reason": "detail_pending",
+                    "message": "the source still lists this certificate but its detail page returned 404",
+                    "attempts": item["attempts"],
+                }
+            )
         return {
             "org_id": org_id,
             "phase": phase,
             "ready": state["ready"],
             "paused": org["paused"],
             "enabled": org["enabled"],
+            "corrections_pending": bool(pending_corrections or pending_reads),
             "catalog": {
                 "version": state["version"],
                 "published_at": state["published_at"],
@@ -313,7 +345,8 @@ class Api:
             "waiting": runtime.get("wait"),
             "reasons": reasons,
             "upstream": runtime,
-            "pending_corrections": self.store.list_pending_corrections(org_id),
+            "pending_corrections": pending_corrections,
+            "pending_reads": pending_reads,
             "checked_at": iso(utcnow()),
         }
 

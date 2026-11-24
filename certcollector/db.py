@@ -133,6 +133,19 @@ SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS pending_reads (
+        org_id TEXT NOT NULL,
+        cert_no TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        first_seen_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, cert_no)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pending_reads_org ON pending_reads(org_id)",
+    """
     CREATE TABLE IF NOT EXISTS exports (
         token TEXT PRIMARY KEY,
         org_id TEXT NOT NULL,

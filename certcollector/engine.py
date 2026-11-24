@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .source import ChangePage, Detail, build_adapter
+from .source import CatalogPage, ChangePage, Detail, build_adapter
 from .store import Store
 from .util import (
     ChannelExpired,
@@ -40,6 +40,7 @@ from .util import (
     UpstreamError,
     dumps,
     iso,
+    parse_iso,
     utcnow,
 )
 
@@ -47,6 +48,12 @@ log = logging.getLogger("certcollector.engine")
 
 FULL = "full"
 INCREMENTAL = "incremental"
+
+# A detail page that the directory still lists but which temporarily answers
+# 404 must not burn the change feed: the group waits and is retried on later
+# runs.  This backoff bounds request pressure while keeping retries prompt.
+BLOCKED_RETRY_BASE = 0.5
+BLOCKED_RETRY_MAX = 5.0
 
 
 class RunAborted(Exception):
@@ -63,11 +70,19 @@ class RebuildContended(Exception):
     pass
 
 
-class IncompleteCorrection(Exception):
-    def __init__(self, correction_id: str, details: dict[str, Any]):
-        super().__init__(f"correction {correction_id} is incomplete")
-        self.correction_id = correction_id
-        self.details = details
+class CorrectionBlocked(Exception):
+    """A staged catalog cannot publish yet: a listed member is unreadable.
+
+    The upstream listing still names ``cert_nos`` but their detail pages return
+    404 (or a correction group cannot be assembled).  The scan keeps its staged
+    work and retries; nothing is published until every listed member resolves
+    or is confirmed removed from the directory.
+    """
+
+    def __init__(self, cert_nos: set[str], detail: dict[str, Any] | None = None):
+        self.cert_nos = set(cert_nos)
+        self.detail = detail or {}
+        super().__init__(f"blocked on unreadable listed members: {sorted(self.cert_nos)}")
 
 
 @dataclass
@@ -122,6 +137,40 @@ def _group_members(entry: dict[str, Any]) -> set[str]:
     if entry.get("cert_no"):
         members.add(entry["cert_no"])
     return members
+
+
+def _group_supersedes(entry: dict[str, Any]) -> set[str]:
+    corr = entry.get("correction") or {}
+    return set(corr.get("supersedes") or [])
+
+
+def _group_consistent(cid: str, entries: dict[str, dict[str, Any]], members: set[str]) -> bool:
+    """Decide whether correction group ``cid`` can be published as staged.
+
+    A formal correction is consistent when every member that the source still
+    publishes carries correction metadata, and every member whose current
+    correction id differs from ``cid`` can be explained as a *re-correction*:
+    the newer correction supersedes this one (its ``supersedes`` intersects the
+    group's members).  That is the roll-forward case where an old correction is
+    formally corrected again — the newer result simply supersedes the older
+    group instead of blocking the catalog forever.
+    """
+    present = [m for m in members if m in entries]
+    if not present:
+        return False
+    for no in present:
+        entry = entries[no]
+        current = (entry.get("correction") or {}).get("id")
+        if not current:
+            return False
+        if current == cid:
+            continue
+        # A different id is only acceptable when this member is the newer face
+        # of a correction that supersedes the group under consideration.
+        newer = entries.get(no, {}).get("correction") or {}
+        if not (set(newer.get("supersedes") or []) & members):
+            return False
+    return True
 
 
 class OrgRuntime:
@@ -329,7 +378,10 @@ class Engine:
         self._started = False
         self._last_auto: dict[str, float] = {}
         self._full_backoff: dict[str, float] = {}
-        self._held_corrections: dict[str, dict[str, dict[str, Any]]] = {}
+        # short-lived cache of the authoritative upstream directory per org,
+        # used to tell "still listed but 404" apart from "removed upstream"
+        self._listing_cache: dict[str, tuple[float, set[str]]] = {}
+        self._listing_lock = threading.Lock()
         self.started_at = iso(utcnow())
 
     # ------------------------------------------------------------------
@@ -358,6 +410,8 @@ class Engine:
         self._started = False
         with self._lock:
             self._runtimes.clear()
+        with self._listing_lock:
+            self._listing_cache.clear()
 
     def _threads_snapshot(self):
         with self._lock:
@@ -368,6 +422,72 @@ class Engine:
     def build_adapter(self, config: dict[str, Any]):
         transport = self.transport_factory(config) if self.transport_factory else None
         return build_adapter(config, transport)
+
+    # ------------------------------------------------------------------
+    # upstream directory helpers
+    def source_listing(self, rt: OrgRuntime, force: bool = False) -> set[str]:
+        """Certificate numbers currently published by the upstream directory.
+
+        The listing is the authority that distinguishes a temporarily
+        unreadable detail page (the number is still in the directory) from a
+        certificate that was actually removed upstream.  Cached briefly so a
+        burst of 404s does not re-page the whole catalog each time.
+        """
+        org_id = rt.org_id
+        now = time.time()
+        if not force:
+            with self._listing_lock:
+                cached = self._listing_cache.get(org_id)
+                if cached and now - cached[0] < 0.5:
+                    return set(cached[1])
+        org = self.store.get_org(org_id)
+        adapter = rt.adapter(org)
+        page: CatalogPage = rt.call(lambda a: a.open_catalog())
+        numbers = {item.cert_no for item in page.items}
+        token = page.next_token
+        while token:
+            rt._check_abort()
+            page = rt.call(lambda a, t=token: a.catalog_page(t))
+            numbers.update(item.cert_no for item in page.items)
+            token = page.next_token
+        with self._listing_lock:
+            self._listing_cache[org_id] = (now, numbers)
+        return set(numbers)
+
+    def invalidate_listing(self, org_id: str) -> None:
+        with self._listing_lock:
+            self._listing_cache.pop(org_id, None)
+
+    def _is_listed(self, rt: OrgRuntime, cert_no: str) -> bool:
+        try:
+            return cert_no in self.source_listing(rt)
+        except (SourceUnavailable, UpstreamError, RateLimited, ChannelExpired):
+            # If the directory itself cannot be read, a 404 on one detail page
+            # must not be interpreted as a removal: wait and retry.
+            return True
+
+    def _record_blocked_reads(self, org_id: str, cert_nos: set[str], reason: str) -> None:
+        for cert_no in sorted(cert_nos):
+            self.store.upsert_pending_read(
+                org_id,
+                cert_no,
+                reason=reason,
+                last_error={"code": "detail_unavailable", "message": "listed upstream but detail returned 404"},
+            )
+
+    @staticmethod
+    def _blocked_delay(attempts: int) -> float:
+        return min(BLOCKED_RETRY_MAX, BLOCKED_RETRY_BASE * (2 ** max(0, attempts - 1)))
+
+    @staticmethod
+    def _due(updated_at: str | None, attempts: int) -> bool:
+        if not updated_at:
+            return True
+        stamp = parse_iso(updated_at)
+        if stamp is None:
+            return True
+        elapsed = (utcnow() - stamp).total_seconds()
+        return elapsed >= min(BLOCKED_RETRY_MAX, BLOCKED_RETRY_BASE * (2 ** max(0, attempts - 1)))
 
     # ------------------------------------------------------------------
     # runtime / lanes
@@ -579,20 +699,38 @@ class Engine:
                 )
                 rt._sleep(0.2 + 0.1 * contended)
                 continue
-            except IncompleteCorrection as exc:
-                self.store.mark_scan(scan["scan_id"], "failed", {"message": str(exc), **exc.details})
-                self.store.delete_scan(scan["scan_id"])
-                self.store.finish_run(
-                    run["run_id"],
-                    "failed",
-                    error={
-                        "code": "incomplete_correction",
-                        "message": str(exc),
-                        "correction_id": exc.correction_id,
-                        **exc.details,
+            except CorrectionBlocked as exc:
+                # A certificate the directory still lists has no readable
+                # detail page (temporarily 404), or a correction group cannot
+                # be assembled yet.  The previous catalog keeps serving; the
+                # staged scan is retained and retried until every listed member
+                # becomes readable or is confirmed removed from the directory.
+                # Re-corrections never fail a rebuild.
+                pending = self.store.list_pending_reads(org_id)
+                attempts = max([int(p["attempts"]) for p in pending], default=1)
+                delay = self._blocked_delay(attempts)
+                self.store.update_run(
+                    run_id,
+                    phase="awaiting_correction",
+                    progress={
+                        "scan_id": scan["scan_id"],
+                        "scan_restarts": restarts,
+                        "waiting_on": sorted(exc.cert_nos),
+                        **exc.detail,
                     },
+                    reason="correction_members_unavailable",
                 )
-                return
+                rt.set_wait(
+                    "correction_pending",
+                    delay,
+                    {"cert_nos": sorted(exc.cert_nos), "attempts": attempts, **exc.detail},
+                )
+                rt._sleep(delay)
+                rt.set_wait(None)
+                # A fresh directory view decides whether a member reappeared
+                # or was removed while we waited.
+                self.invalidate_listing(org_id)
+                continue
             except ScanExpired as exc:
                 restarts += 1
                 self.store.mark_scan(scan["scan_id"], "expired", {"message": str(exc)})
@@ -685,17 +823,26 @@ class Engine:
         if scan["status"] in ("fetching", "listing"):
             pending = self.store.pending_scan_items(scan_id)
             done = 0
+            blocked: set[str] = set()
             for cert_no in pending:
                 rt._check_abort()
                 try:
                     detail = rt.call(lambda a, no=cert_no: a.detail(no))
                 except NotFound:
+                    if self._is_listed(rt, cert_no):
+                        # Still in the upstream directory but its detail page
+                        # is temporarily 404: keep it staged as pending and wait
+                        # instead of treating the certificate as deleted.
+                        blocked.add(cert_no)
+                        continue
                     self.store.set_scan_item(scan_id, cert_no, status="deleted")
+                    done += 1
                     continue
                 entry = _entry_from_detail(detail)
                 self.store.set_scan_item(
                     scan_id, cert_no, status="ok", payload=entry, revision=detail.revision
                 )
+                self.store.clear_pending_read(org_id, cert_no)
                 done += 1
                 if done % 10 == 0:
                     counts = self.store.scan_item_counts(scan_id)
@@ -709,6 +856,9 @@ class Engine:
                             "details_total": counts.get("total", 0),
                         },
                     )
+            if blocked:
+                self._record_blocked_reads(org_id, blocked, "detail_404_while_listed")
+                raise CorrectionBlocked(blocked)
             counts = self.store.scan_item_counts(scan_id)
             self.store.update_run(
                 run_id,
@@ -781,7 +931,10 @@ class Engine:
             # Details are authoritative current content, so resolving every
             # touched certificate (not trusting the event's order/kind) makes
             # duplicated and reordered events harmless.
-            present, gone = self._stage_details(rt, scan_id, touched, return_status=True)
+            present, gone, blocked = self._stage_details(rt, scan_id, touched, return_status=True)
+            if blocked:
+                self._record_blocked_reads(run["org_id"], blocked, "detail_404_while_listed")
+                raise CorrectionBlocked(blocked)
             if gone:
                 self.store.mark_scan_items_deleted(scan_id, sorted(gone))
             elif present:
@@ -818,11 +971,18 @@ class Engine:
     ):
         present: set[str] = set()
         gone: set[str] = set()
+        blocked: set[str] = set()
         for cert_no in sorted(cert_nos):
             rt._check_abort()
             try:
                 detail = rt.call(lambda a, no=cert_no: a.detail(no))
             except NotFound:
+                if self._is_listed(rt, cert_no):
+                    # Directory still lists the number: its detail is only
+                    # temporarily unreadable.  Leave any staged row untouched so
+                    # the scan waits rather than dropping a live certificate.
+                    blocked.add(cert_no)
+                    continue
                 self.store.set_scan_item(scan_id, cert_no, status="deleted")
                 gone.add(cert_no)
                 continue
@@ -835,13 +995,25 @@ class Engine:
             )
             present.add(cert_no)
         if return_status:
-            return present, gone
+            return present, gone, blocked
         return None
 
     def _assemble_staged(
         self, rt: OrgRuntime, run: dict[str, Any], scan: dict[str, Any]
     ) -> dict[str, dict[str, Any]]:
+        """Build the publishable snapshot, waiting on any unreadable member.
+
+        Correction groups are all-or-nothing: a group only publishes when every
+        member the upstream directory still lists is present and consistent.
+        A 404 on a still-listed member raises :class:`CorrectionBlocked` so the
+        whole scan retries without publishing; a member confirmed removed from
+        the directory simply stays absent, which matches the live source.
+        Re-corrections (a member now pointing at a newer correction that
+        supersedes this group) are accepted as consistent roll-forward state.
+        """
+        org_id = run["org_id"]
         scan_id = scan["scan_id"]
+        blocked: set[str] = set()
         for _ in range(4):
             rt._check_abort()
             items = self.store.scan_items(scan_id)
@@ -856,40 +1028,58 @@ class Engine:
                 if key:
                     groups.setdefault(key, set()).update(_group_members(entry))
             missing_fetch: set[str] = set()
-            incomplete: list[str] = []
+            inconsistent: list[str] = []
             for cid, members in groups.items():
                 absent = {m for m in members if m not in entries}
                 if absent:
                     missing_fetch |= absent
                     continue
-                ids = {
-                    (entries[m].get("correction") or {}).get("id")
-                    for m in members
-                    if m in entries
-                }
-                if ids != {cid}:
-                    incomplete.append(cid)
+                if not _group_consistent(cid, entries, members):
+                    inconsistent.append(cid)
             if missing_fetch:
-                # details already staged may be stale; refetch the absent ones
-                fetched_any = self._stage_details_visible(rt, scan_id, missing_fetch)
-                if not fetched_any:
-                    raise IncompleteCorrection(
-                        next(iter(groups), "unknown"), {"missing": sorted(missing_fetch)}
-                    )
+                # Absent members may be temporarily unreadable details.  Refetch
+                # them; any still 404 *and still listed* blocks publication.
+                blocked |= self._refetch_or_block(rt, org_id, scan_id, missing_fetch)
+                if blocked:
+                    self._record_blocked_reads(org_id, blocked, "correction_member_404")
+                    raise CorrectionBlocked(blocked, {"groups": sorted(groups)})
                 continue
-            if incomplete:
+            if inconsistent:
                 refresh = {
                     m
-                    for cid in incomplete
+                    for cid in inconsistent
                     for m in groups.get(cid, set())
                     if m in entries
                 }
                 if refresh and self._stage_details_visible(rt, scan_id, refresh):
                     continue
-                raise IncompleteCorrection(incomplete[0], {"incomplete": incomplete})
-            # drop correction members that are not published (deleted upstream)
+                # Refreshed details still do not line up: treat it as a waiting
+                # condition rather than a permanent failure, since a partially
+                # published re-correction upstream may resolve on the next read.
+                blocked |= refresh
+                self._record_blocked_reads(org_id, blocked, "correction_group_inconsistent")
+                raise CorrectionBlocked(blocked, {"incomplete": inconsistent})
             return entries
-        raise IncompleteCorrection("unknown", {"reason": "group never became consistent"})
+        raise CorrectionBlocked(blocked or set(), {"reason": "group never became consistent"})
+
+    def _refetch_or_block(self, rt: OrgRuntime, org_id: str, scan_id: str, cert_nos: set[str]) -> set[str]:
+        """Refetch absent members; return the ones still listed but unreadable."""
+        blocked: set[str] = set()
+        for cert_no in sorted(cert_nos):
+            rt._check_abort()
+            try:
+                detail = rt.call(lambda a, no=cert_no: a.detail(no))
+            except NotFound:
+                if self._is_listed(rt, cert_no):
+                    blocked.add(cert_no)
+                    continue
+                self.store.set_scan_item(scan_id, cert_no, status="deleted")
+                continue
+            self.store.set_scan_item(
+                scan_id, cert_no, status="ok", payload=_entry_from_detail(detail), revision=detail.revision
+            )
+            self.store.clear_pending_read(org_id, cert_no)
+        return blocked
 
     def _stage_details_visible(self, rt: OrgRuntime, scan_id: str, cert_nos: set[str]) -> bool:
         got = False
@@ -898,6 +1088,8 @@ class Engine:
             try:
                 detail = rt.call(lambda a, no=cert_no: a.detail(no))
             except NotFound:
+                if self._is_listed(rt, cert_no):
+                    continue
                 self.store.set_scan_item(scan_id, cert_no, status="deleted")
                 continue
             self.store.set_scan_item(
@@ -984,26 +1176,44 @@ class Engine:
         touched = {e.cert_no for e in page.items if e.cert_no}
         details: dict[str, dict[str, Any]] = {}
         deletes: set[str] = set()
+        unreadable: set[str] = set()
         for cert_no in sorted(touched):
             rt._check_abort()
             try:
                 detail = rt.call(lambda a, no=cert_no: a.detail(no))
             except NotFound:
-                # whether the event was a delete, a purge, or a stale upsert
-                # for something already gone, the live document decides.
+                # A 404 is only a real removal when the number has left the
+                # upstream directory.  A still-listed number with a missing
+                # detail page is held back and retried later; it never becomes
+                # a delete and never blocks unrelated revisions.
+                if self._is_listed(rt, cert_no):
+                    unreadable.add(cert_no)
+                    continue
                 deletes.add(cert_no)
                 continue
             details[cert_no] = _entry_from_detail(detail)
+            self.store.clear_pending_read(org_id, cert_no)
         held: list[dict[str, Any]] = []
-        entries = self._resolve_incremental_groups(rt, details, held)
+        entries = self._resolve_incremental_groups(rt, details, held, unreadable=unreadable)
         for group in held:
+            members = set(group.get("expected") or []) | set(group.get("supersedes") or [])
             self.store.upsert_pending_correction(
                 org_id,
                 group["correction_id"],
                 old_cert_nos=group["supersedes"],
-                expected=group["expected"],
+                expected=sorted(group.get("expected_members", members)),
                 state="incomplete",
-                last_error={"code": "incomplete_correction", "message": "waiting for all members"},
+                last_error=group.get(
+                    "last_error",
+                    {"code": "incomplete_correction", "message": "waiting for all members"},
+                ),
+            )
+        for cert_no in unreadable:
+            self.store.upsert_pending_read(
+                org_id,
+                cert_no,
+                reason="detail_404_while_listed",
+                last_error={"code": "detail_unavailable", "message": "listed upstream but detail returned 404"},
             )
         seq = page.next_seq if page.next_seq is not None else page.head_seq
         state = self.store.get_state(org_id)
@@ -1023,52 +1233,53 @@ class Engine:
         for group in held:
             if not group.get("held"):
                 self.store.clear_pending_correction(org_id, group["correction_id"])
-                self._clear_correction_failure(org_id, group["correction_id"])
+        for cert_no in deletes:
+            self.store.clear_pending_read(org_id, cert_no)
+        # a member confirmed removed from the directory also leaves the read queue
+        for cert_no in touched - unreadable:
+            self.store.clear_pending_read(org_id, cert_no)
 
     def _resolve_incremental_groups(
         self,
         rt: OrgRuntime,
         details: dict[str, dict[str, Any]],
         held: list[dict[str, Any]],
+        *,
+        unreadable: set[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
+        """Apply all-or-nothing correction groups to a change window.
+
+        ``unreadable`` are certificate numbers that the change feed touched,
+        the upstream directory still lists, but whose detail pages answer 404.
+        Any group that references such a member is held back atomically;
+        unrelated certificates in the same window are still returned for
+        publication.  A member confirmed removed from the directory is simply
+        absent and does not block the remaining group.  Re-corrections (a
+        member's current correction id differs because a newer correction
+        supersedes this one) are accepted as roll-forward consistency.
+        """
+        unreadable = set(unreadable or set())
         groups: dict[str, set[str]] = {}
         for no, entry in details.items():
             key = _entry_group_key(entry)
             if key:
                 groups.setdefault(key, set()).update(_group_members(entry))
-        if not groups:
+        if not groups and not unreadable:
             return dict(details)
         entries = dict(details)
         excluded: set[str] = set()
-        cooling = self._correction_cooldown(rt.org_id)
         for cid, members in groups.items():
-            if cid in cooling:
-                for member in members:
-                    entries.pop(member, None)
-                held.append(
-                    {
-                        "correction_id": cid,
-                        "held": True,
-                        "supersedes": sorted(
-                            {
-                                old
-                                for m in members
-                                for old in ((details.get(m) or {}).get("correction") or {}).get(
-                                    "supersedes", []
-                                )
-                            }
-                        ),
-                    }
-                )
-                continue
             for _ in range(3):
-                absent = {m for m in members if m not in entries and m not in excluded}
+                absent = {m for m in members if m not in entries and m not in excluded and m not in unreadable}
                 if not absent:
                     break
                 for member in sorted(absent):
                     try:
                         detail = rt.call(lambda a, no=member: a.detail(no))
                     except NotFound:
+                        if self._is_listed(rt, member):
+                            unreadable.add(member)
+                            continue
                         excluded.add(member)
                         continue
                     fetched = _entry_from_detail(detail)
@@ -1076,123 +1287,220 @@ class Engine:
                     members |= _group_members(fetched)
             members -= excluded
             present = [m for m in members if m in entries]
-            ids = {(entries[m].get("correction") or {}).get("id") for m in present}
-            # A member that the listing names but whose detail is gone (purged
-            # or never published) must not block the group forever.  The
-            # remaining members are published together; the vanished number is
-            # simply absent, which is consistent with the live source.
-            consistent = bool(present) and ids == {cid} and all(
-                (entries[m].get("correction") or {}).get("members") for m in present
-            )
-            if not consistent and excluded:
-                consistent = bool(present) and ids == {cid}
-            if not consistent:
-                if excluded:
-                    self._note_correction_failure(rt.org_id, cid, set(excluded))
+            # A member whose detail cannot be read while it is still listed by
+            # the directory holds the whole group until it resolves or leaves
+            # the directory.  Everything else in the window still publishes.
+            blocked_members = {m for m in members if m in unreadable}
+            if blocked_members:
+                supersedes = self._group_supersedes(cid, entries, members)
+                held.append(
+                    {
+                        "correction_id": cid,
+                        "held": True,
+                        "expected": sorted(members | excluded | unreadable),
+                        "expected_members": sorted(members | blocked_members),
+                        "supersedes": sorted(supersedes),
+                        "last_error": {
+                            "code": "member_detail_unavailable",
+                            "message": "listed member detail returned 404; correction waits",
+                            "waiting_on": sorted(blocked_members),
+                        },
+                    }
+                )
+                for member in list(members) + list(blocked_members):
+                    entries.pop(member, None)
+                continue
+            if not _group_consistent(cid, entries, members):
+                supersedes = self._group_supersedes(cid, entries, members)
                 held.append(
                     {
                         "correction_id": cid,
                         "expected": sorted(members | excluded),
-                        "supersedes": sorted(
-                            {
-                                old
-                                for m in present
-                                for old in ((entries[m].get("correction") or {}).get("supersedes") or [])
-                            }
-                        ),
+                        "expected_members": sorted(members),
+                        "supersedes": sorted(supersedes),
+                        "last_error": {
+                            "code": "incomplete_correction",
+                            "message": "correction group not yet consistent upstream",
+                        },
                     }
                 )
                 for member in members | excluded:
                     entries.pop(member, None)
         return entries
 
-    def _correction_cooldown(self, org_id: str) -> set[str]:
-        """Corrections whose members keep failing detail lookups recently.
-
-        A group whose listed members cannot all be read is retried a few times
-        and then held back for a while, instead of blocking or blindly pruning
-        a member that may simply be temporarily unavailable.
-        """
-        now = time.time()
-        cooldown = self._held_corrections.setdefault(org_id, {})
-        ready = set()
-        for cid, info in list(cooldown.items()):
-            if now - info["since"] > 30.0:
-                cooldown.pop(cid, None)
+    @staticmethod
+    def _group_supersedes(
+        cid: str, entries: dict[str, dict[str, Any]], members: set[str]
+    ) -> set[str]:
+        olds: set[str] = set()
+        for no in members:
+            entry = entries.get(no)
+            if entry is None:
                 continue
-            if info["failures"] >= 3:
-                ready.add(cid)
-        return ready
-
-    def _note_correction_failure(self, org_id: str, cid: str, missing: set[str]) -> None:
-        cooldown = self._held_corrections.setdefault(org_id, {})
-        info = cooldown.setdefault(cid, {"failures": 0, "since": time.time(), "missing": []})
-        info["failures"] += 1
-        info["missing"] = sorted(missing)
-
-    def _clear_correction_failure(self, org_id: str, cid: str) -> None:
-        self._held_corrections.get(org_id, {}).pop(cid, None)
+            corr = entry.get("correction") or {}
+            if corr.get("id") == cid:
+                olds.update(corr.get("supersedes") or [])
+        return olds
 
     def _reconcile_pending(self, rt: OrgRuntime, run: dict[str, Any]) -> None:
+        """Retry durable held state until the source resolves it.
+
+        Two durable queues survive restarts: individual listed-but-404 detail
+        reads (``pending_reads``) and all-or-nothing correction groups
+        (``pending_corrections``).  Neither is ever abandoned: a member that
+        becomes readable converges the group; a member confirmed removed from
+        the directory converges the remaining members without it.  Backoff is
+        stored on the rows themselves so retries stay bounded across restarts.
+        """
         org_id = run["org_id"]
+        pending_reads = self.store.list_pending_reads(org_id)
         pending = self.store.list_pending_corrections(org_id)
-        if not pending:
+        if not pending_reads and not pending:
             return
         state = self.store.get_state(org_id)
         if not state["ready"]:
             return
-        for item in pending:
+
+        # 1. retry individual unreadable detail pages --------------------
+        recovered: dict[str, dict[str, Any]] = {}
+        still_blocked: set[str] = set()
+        for item in pending_reads:
             rt._check_abort()
-            if item["attempts"] >= 20:
-                # unresolvable from the source; keep the old state untouched and
-                # surface it through the status endpoint instead of looping.
-                if item["state"] != "abandoned":
-                    self.store.upsert_pending_correction(
+            cert_no = item["cert_no"]
+            if not self._due(item["updated_at"], item["attempts"]):
+                continue
+            try:
+                detail = rt.call(lambda a, no=cert_no: a.detail(no))
+            except NotFound:
+                if self._is_listed(rt, cert_no):
+                    still_blocked.add(cert_no)
+                    self.store.upsert_pending_read(
                         org_id,
-                        item["correction_id"],
-                        old_cert_nos=item["old_cert_nos"],
-                        expected=item["expected"],
-                        state="abandoned",
+                        cert_no,
+                        reason=item["reason"],
                         last_error={
-                            "code": "incomplete_correction",
-                            "message": "members could not be resolved from the source",
+                            "code": "detail_unavailable",
+                            "message": "listed upstream but detail returned 404",
                         },
                     )
+                    continue
+                # confirmed removed from the directory: nothing to recover,
+                # and the durable wait entry must not linger
+                self.store.clear_pending_read(org_id, cert_no)
+                continue
+            recovered[cert_no] = _entry_from_detail(detail)
+
+        # 2. retry held correction groups --------------------------------
+        group_held: list[dict[str, Any]] = []
+        for item in pending:
+            rt._check_abort()
+            if not self._due(item["updated_at"], item["attempts"]):
                 continue
             expected = set(item["expected"]) | set(item["old_cert_nos"])
             details: dict[str, dict[str, Any]] = {}
             blocked = False
+            removed: set[str] = set()
             for cert_no in sorted(expected):
                 try:
                     detail = rt.call(lambda a, no=cert_no: a.detail(no))
                 except NotFound:
-                    blocked = True
+                    if self._is_listed(rt, cert_no):
+                        blocked = True
+                        still_blocked.add(cert_no)
+                        self.store.upsert_pending_read(
+                            org_id,
+                            cert_no,
+                            reason="correction_member_404",
+                            last_error={
+                                "code": "detail_unavailable",
+                                "message": "listed upstream but detail returned 404",
+                            },
+                        )
+                        continue
+                    # removed upstream: simply absent, consistent with source;
+                    # drop any durable wait entry for it as well
+                    removed.add(cert_no)
+                    self.store.clear_pending_read(org_id, cert_no)
                     continue
                 details[cert_no] = _entry_from_detail(detail)
             held: list[dict[str, Any]] = []
             entries = self._resolve_incremental_groups(rt, details, held)
             if blocked or held:
-                self.store.upsert_pending_correction(
-                    org_id,
-                    item["correction_id"],
-                    old_cert_nos=item["old_cert_nos"],
-                    expected=sorted(expected),
-                    state="incomplete",
-                    last_error={"code": "incomplete_correction", "message": "members not fully available"},
-                )
+                group_held.append((item, held, blocked))
                 continue
-            published = self.store.publish_incremental(
-                org_id,
-                list(entries.values()),
-                [],
-                watermark_cursor=state["watermark_cursor"],
-                watermark_seq=state["watermark_seq"],
-                head_cursor=state["source_head_cursor"],
-                head_seq=state["source_head_seq"],
-            )
-            if published is None:
-                continue
+            self._publish_reconciled(rt, org_id, entries.values(), state)
             self.store.clear_pending_correction(org_id, item["correction_id"])
+            for cert_no in expected:
+                if cert_no in entries or cert_no in removed:
+                    self.store.clear_pending_read(org_id, cert_no)
+            state = self.store.get_state(org_id)
+
+        # 3. publish recovered standalone reads --------------------------
+        # Members of still-held correction groups are published atomically by
+        # step 2; never publish a recovered group member on its own here.
+        group_members: set[str] = set()
+        for item in pending:
+            group_members.update(item["expected"])
+            group_members.update(item["old_cert_nos"])
+        standalone = {no: entry for no, entry in recovered.items() if no not in group_members}
+        if standalone:
+            self._publish_reconciled(rt, org_id, standalone.values(), state)
+            for cert_no in standalone:
+                self.store.clear_pending_read(org_id, cert_no)
+
+        # 4. record whatever is still waiting, with explicit status text -
+        for item, held, blocked in group_held:
+            expected = set(item["expected"]) | set(item["old_cert_nos"])
+            self.store.upsert_pending_correction(
+                org_id,
+                item["correction_id"],
+                old_cert_nos=item["old_cert_nos"],
+                expected=sorted(expected),
+                state="incomplete",
+                last_error={
+                    "code": "member_detail_unavailable" if blocked else "incomplete_correction",
+                    "message": (
+                        "listed member detail returned 404; correction waits"
+                        if blocked
+                        else "correction group not yet consistent upstream"
+                    ),
+                    "waiting_on": sorted(
+                        {no for h in held for no in (h.get("expected_members") or [])}
+                    ),
+                },
+            )
+        if still_blocked:
+            delay = self._blocked_delay(
+                max(
+                    [p["attempts"] for p in self.store.list_pending_reads(org_id)]
+                    + [p["attempts"] for p in self.store.list_pending_corrections(org_id)]
+                    or [1]
+                )
+            )
+            rt.set_wait(
+                "correction_pending",
+                delay,
+                {"cert_nos": sorted(still_blocked)},
+            )
+
+    def _publish_reconciled(
+        self, rt: OrgRuntime, org_id: str, entries: Any, state: dict[str, Any]
+    ) -> None:
+        rows = list(entries)
+        if not rows:
+            return
+        published = self.store.publish_incremental(
+            org_id,
+            rows,
+            [],
+            watermark_cursor=state["watermark_cursor"],
+            watermark_seq=state["watermark_seq"],
+            head_cursor=state["source_head_cursor"],
+            head_seq=state["source_head_seq"],
+        )
+        if published is None:
+            return
+        self.invalidate_listing(org_id)
 
     def _schedule_recovery(self, org_id: str, reason: str) -> None:
         if self.store.has_active_run(org_id, (FULL,)):

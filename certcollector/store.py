@@ -917,6 +917,7 @@ class Store:
                 "attempts": int(r["attempts"]),
                 "last_error": loads(r["last_error"]) if r["last_error"] else None,
                 "first_seen_at": r["first_seen_at"],
+                "updated_at": r["updated_at"],
             }
             for r in rows
         ]
@@ -924,6 +925,63 @@ class Store:
     def clear_pending_correction(self, org_id: str, correction_id: str) -> None:
         self.execute_checked(
             "DELETE FROM pending_corrections WHERE org_id=? AND correction_id=?", (org_id, correction_id)
+        )
+
+    # ------------------------------------------------------------------
+    # pending reads (listed certificates whose detail page is answering 404)
+    def upsert_pending_read(
+        self,
+        org_id: str,
+        cert_no: str,
+        *,
+        reason: str,
+        last_error: dict[str, Any] | None = None,
+    ) -> None:
+        now = _now()
+        with self.db.transaction(write=True) as tx:
+            row = tx.fetchone(
+                self.db._translate(
+                    "SELECT * FROM pending_reads WHERE org_id=? AND cert_no=?"
+                ),
+                (org_id, cert_no),
+            )
+            if row is None:
+                tx.execute(
+                    self.db._translate(
+                        "INSERT INTO pending_reads(org_id,cert_no,reason,attempts,last_error,"
+                        "first_seen_at,updated_at) VALUES (?,?,?,1,?,?,?)"
+                    ),
+                    (org_id, cert_no, reason, dumps(last_error) if last_error else None, now, now),
+                )
+            else:
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE pending_reads SET reason=?, attempts=attempts+1, last_error=?, "
+                        "updated_at=? WHERE org_id=? AND cert_no=?"
+                    ),
+                    (reason, dumps(last_error) if last_error else None, now, org_id, cert_no),
+                )
+
+    def list_pending_reads(self, org_id: str) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM pending_reads WHERE org_id=? ORDER BY first_seen_at, cert_no",
+            (org_id,),
+        )
+        return [
+            {
+                "cert_no": r["cert_no"],
+                "reason": r["reason"],
+                "attempts": int(r["attempts"]),
+                "last_error": loads(r["last_error"]) if r["last_error"] else None,
+                "first_seen_at": r["first_seen_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def clear_pending_read(self, org_id: str, cert_no: str) -> None:
+        self.execute_checked(
+            "DELETE FROM pending_reads WHERE org_id=? AND cert_no=?", (org_id, cert_no)
         )
 
     # ------------------------------------------------------------------
@@ -1125,7 +1183,7 @@ class Store:
     # diagnostics
     def storage_counts(self) -> dict[str, int]:
         counts = {}
-        for table in ("orgs", "runs", "scans", "scan_items", "certs", "exports", "export_items", "pending_corrections"):
+        for table in ("orgs", "runs", "scans", "scan_items", "certs", "exports", "export_items", "pending_corrections", "pending_reads"):
             row = self.db.query_one(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = int(row["n"]) if row else 0
         return counts

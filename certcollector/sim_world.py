@@ -104,6 +104,10 @@ class World:
         self.certs: dict[str, CertRecord] = {}
         self.snapshots: dict[str, Snapshot] = {}
         self.cursor_epoch = 0.0
+        # Certificate numbers whose detail pages must answer 404 even though
+        # the certificates are still part of the catalog (listing included).
+        # Models a body whose detail publication lags the directory entry.
+        self.hidden_details: set[str] = set()
         self.rng = random.Random(seed)
         self.config: dict[str, Any] = {
             "max_concurrency": 4,
@@ -329,6 +333,10 @@ class World:
             rec = self.certs.get(cert_no)
             if rec is None or rec.purged:
                 raise WorldError(404, "cert_not_found", "certificate not found")
+            if cert_no in self.hidden_details:
+                # The directory still lists this number; only the detail page
+                # is temporarily unavailable.
+                raise WorldError(404, "cert_not_found", "certificate detail temporarily unavailable")
             if revision is None or revision == rec.revision:
                 return self._cert_view(rec)
             for entry in rec.history:
@@ -585,8 +593,28 @@ class World:
             rec.purged = True
             rec.seq = seq
             rec.updated_at = when
+            self.hidden_details.discard(cert_no)
             self.events.append(self._event(seq, "delete", cert_no, display_at=when))
             return {"cert_no": cert_no, "deleted": True, "seq": seq}
+
+    def hide_detail(self, cert_nos: list[str]) -> dict[str, Any]:
+        """Make detail pages answer 404 while the catalog keeps listing the numbers."""
+        with self.lock:
+            missing = [no for no in cert_nos if no not in self.certs or self.certs[no].purged]
+            if missing:
+                raise WorldError(404, "cert_not_found", "certificate not found")
+            self.hidden_details.update(cert_nos)
+            return {"hidden": sorted(self.hidden_details)}
+
+    def show_detail(self, cert_nos: list[str] | None = None) -> dict[str, Any]:
+        """Make detail pages readable again (all of them when no numbers are given)."""
+        with self.lock:
+            if cert_nos is None:
+                self.hidden_details.clear()
+            else:
+                for no in cert_nos:
+                    self.hidden_details.discard(no)
+            return {"hidden": sorted(self.hidden_details)}
 
     # ------------------------------------------------------------------
     # admin helpers
@@ -614,6 +642,7 @@ class World:
                 "counters": dict(self.counters),
                 "active_requests": self._active,
                 "snapshots": len(self.snapshots),
+                "hidden_details": sorted(self.hidden_details),
             }
 
     def update_config(self, changes: dict[str, Any]) -> dict[str, Any]:
@@ -644,6 +673,7 @@ class World:
             self.certs.clear()
             self.snapshots.clear()
             self.cursor_epoch = 0.0
+            self.hidden_details.clear()
             self.counters = {k: 0 for k in self.counters}
             for i in range(count):
                 data = _seed_cert(self.site, i)

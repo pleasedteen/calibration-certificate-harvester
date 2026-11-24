@@ -13,6 +13,9 @@ Both sites expose the same logical capabilities with different transports:
     ``GET /api/v1/changes?cursor=``         JSON change feed
 
 Both implement ``/__admin/*`` helpers used by the demos and the test suite.
+The ``hide-detail`` / ``show-detail`` actions make a certificate's detail page
+answer 404 while it stays present in catalog snapshots, modelling a body whose
+detail publication temporarily lags its directory.
 """
 
 from __future__ import annotations
@@ -202,6 +205,12 @@ class HtmlSite:
             data = json.loads(body) if body else {}
             self.world.reset(int(data.get("count", 20)))
             return _json_response(200, {"reset": True})
+        if action == "hide-detail":
+            return _json_response(200, self.world.hide_detail(_cert_nos(body)))
+        if action == "show-detail":
+            data = json.loads(body) if body else {}
+            cert_nos = _cert_nos(body) if data else None
+            return _json_response(200, self.world.show_detail(cert_nos))
         return _json_response(404, {"error": "unknown_admin_action"})
 
 
@@ -321,7 +330,25 @@ class JsonSite:
         if action == "reset":
             self.world.reset(int(json.loads(body or "{}").get("count", 20)))
             return _json_response(200, {"reset": True})
+        if action == "hide-detail":
+            return _json_response(200, self.world.hide_detail(_cert_nos(body)))
+        if action == "show-detail":
+            data = json.loads(body) if body else {}
+            cert_nos = _cert_nos(body) if data else None
+            return _json_response(200, self.world.show_detail(cert_nos))
         return _json_response(404, {"error": "unknown_admin_action"})
+
+
+def _cert_nos(body: Any) -> list[str]:
+    data = json.loads(body) if isinstance(body, str) and body else (body or {})
+    if isinstance(data, str):
+        return [data]
+    if isinstance(data, list):
+        return [str(no) for no in data]
+    raw = data.get("cert_nos") or data.get("cert_no") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(no) for no in raw]
 
 
 def _b64encode(raw: bytes) -> str:

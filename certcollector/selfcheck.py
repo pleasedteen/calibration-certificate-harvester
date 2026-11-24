@@ -82,6 +82,75 @@ def run() -> int:
 
         _check("multi-certificate correction applied atomically", corrections, results)
 
+        def held_correction():
+            # a replacement stays listed while its detail page answers 404:
+            # the correction waits, an unrelated revision still applies, and
+            # the group converges atomically once the detail is readable
+            baseline = rt.store.get_state("json-lab")["cert_count"]
+            world.revise_cert("C-1004", {"temperature": "23.5 C"})
+            result = world.correction(
+                "C-1005",
+                [
+                    {"cert_no": "C-7101", "data": {"instrument": "Balance"}},
+                    {"cert_no": "C-7102", "data": {"instrument": "Gauge"}},
+                ],
+            )
+            cid = result["correction_id"]
+            world.hide_detail(["C-7102"])
+            _wait(
+                lambda: any(
+                    p["correction_id"] == cid
+                    for p in rt.store.list_pending_corrections("json-lab")
+                ),
+                timeout=15,
+            )
+            # unrelated revision lands while the correction is held
+            _wait(lambda: rt.store.get_cert("json-lab", "C-1004")["revision"] == 2)
+            assert rt.store.get_cert("json-lab", "C-1005")["status"] == "active"
+            assert rt.store.get_state("json-lab")["cert_count"] == baseline
+            status = rt.api._status("json-lab")
+            assert status["corrections_pending"] is True
+            world.show_detail(["C-7102"])
+            _wait(
+                lambda: rt.store.get_cert("json-lab", "C-1005")["status"] == "revoked"
+                and rt.store.get_cert("json-lab", "C-7102")["status"] == "active"
+                and rt.store.get_state("json-lab")["caught_up"],
+                timeout=25,
+            )
+            assert not rt.store.list_pending_corrections("json-lab")
+            assert not rt.store.list_pending_reads("json-lab")
+            return "held while 404, converged atomically after heal"
+
+        _check("listed-but-404 correction waits then converges", held_correction, results)
+
+        def recorrection_chain():
+            # formally correct an existing replacement: both lanes must accept
+            # the roll-forward instead of holding/failing on the group
+            world.correction(
+                "C-7101",
+                [
+                    {"cert_no": "C-7201", "data": {"instrument": "Balance A2"}},
+                    {"cert_no": "C-7202", "data": {"instrument": "Balance A3"}},
+                ],
+            )
+            _wait(
+                lambda: rt.store.get_cert("json-lab", "C-7101")["status"] == "revoked"
+                and rt.store.get_cert("json-lab", "C-7202")["status"] == "active"
+                and rt.store.get_state("json-lab")["caught_up"],
+                timeout=25,
+            )
+            assert not rt.store.list_pending_corrections("json-lab")
+            run = rt.engine.request_full("json-lab", "selfcheck-chain")
+            _wait(lambda: rt.store.get_run(run["run_id"])["status"] == "succeeded", timeout=25)
+            stored = {
+                c["cert_no"] for c in rt.store.list_certs("json-lab", page=1, page_size=500)["items"]
+            }
+            live = {c["cert_no"] for c in world.state()["certs"]}
+            assert stored == live
+            return "re-correction applied incrementally and survived a full rebuild"
+
+        _check("re-correction chains publish fully on both lanes", recorrection_chain, results)
+
         def online_rebuild():
             before = rt.store.get_state("html-lab")
             rt.simulator.html_world.update_config({"slow_ms": 5})
