@@ -37,13 +37,21 @@ def _embedded_url() -> str:
 
 
 class Simulator:
-    """Both simulated bodies served through one loopback router."""
+    """The simulated bodies served through one loopback router.
 
-    def __init__(self, seed: int = 7, count: int = 20):
+    ``html`` and ``json`` are the two regular calibration bodies.  ``alt`` is a
+    smaller, independently sequenced body used to exercise source switching:
+    its sequence numbers and revisions start below the other bodies', which is
+    exactly the case a cutover must not reject.
+    """
+
+    def __init__(self, seed: int = 7, count: int = 20, alt_count: int = 6):
         self.html_world = World("html", count=count, seed=seed)
         self.json_world = World("json", count=count, seed=seed + 1)
+        self.alt_world = World("alt", count=alt_count, seed=seed + 2)
         self.html_site = HtmlSite(self.html_world)
         self.json_site = JsonSite(self.json_world)
+        self.alt_site = JsonSite(self.alt_world)
 
     def handler(self, request: dict[str, Any]):
         path = request["path"]
@@ -51,16 +59,25 @@ class Simulator:
             inner = dict(request)
             inner["path"] = path[len("/json") :] or "/"
             return self.json_site.handle(inner)
+        if path.startswith("/alt"):
+            inner = dict(request)
+            inner["path"] = path[len("/alt") :] or "/"
+            return self.alt_site.handle(inner)
         return self.html_site.handle(request)
 
     def base_urls(self) -> dict[str, str]:
-        return {"html": "http://sim.local", "json": "http://sim.local/json"}
+        return {
+            "html": "http://sim.local",
+            "json": "http://sim.local/json",
+            "alt": "http://sim.local/alt",
+        }
 
     def transport(self, config: dict[str, Any]):
-        base_url = str(config.get("base_url") or "")
-        kind = config.get("kind")
-        expected = self.base_urls().get(kind or "html")
-        if expected and base_url.rstrip("/") == expected.rstrip("/"):
+        base_url = str(config.get("base_url") or "").rstrip("/")
+        for prefix in ("/alt", "/json"):
+            if base_url == "http://sim.local" + prefix:
+                return LoopbackTransport(self.handler, "http://sim.local")
+        if base_url == "http://sim.local":
             return LoopbackTransport(self.handler, "http://sim.local")
         return None
 

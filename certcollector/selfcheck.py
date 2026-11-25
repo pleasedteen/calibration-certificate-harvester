@@ -100,6 +100,72 @@ def run() -> int:
 
         _check("online rebuild keeps the published catalog serving", online_rebuild, results)
 
+        def source_switch():
+            alt = rt.simulator.alt_world
+            old_state = rt.store.get_state("json-lab")
+            # push the old source past the alt body's seq space and a shared
+            # number past its revision: the switch must still be accepted
+            world.revise_cert("C-1001", {"temperature": "33.0 C"})
+            _wait(
+                lambda: rt.store.get_cert("json-lab", "C-1001")["revision"] >= 2
+                and rt.store.get_state("json-lab")["caught_up"]
+            )
+            assert alt.seq < rt.store.get_state("json-lab")["watermark_seq"]
+            export = rt.store.create_export("json-lab", 5, 300)
+            frozen_total = export["total"]
+            frozen_version = export["catalog_version"]
+
+            alt.set_enabled(False)
+            switch = rt.engine.request_switch(
+                "json-lab", {"kind": "json", "base_url": "http://sim.local/alt", "timeout": 20}
+            )
+            assert switch["status"] == "pending"
+            time.sleep(0.4)
+            # the old catalog keeps serving while the new body is unavailable
+            mid = rt.store.get_state("json-lab")
+            assert mid["ready"] and mid["active_epoch"] == old_state["active_epoch"]
+            assert mid["cert_count"] == old_state["cert_count"]
+            alt.set_enabled(True)
+            _wait(lambda rt=rt: rt.store.get_pending_switch("json-lab") is None, timeout=30)
+            after = rt.store.get_state("json-lab")
+            assert after["active_epoch"] == old_state["active_epoch"] + 1
+            assert after["cert_count"] == len(alt.state()["certs"])
+            assert after["watermark_seq"] <= alt.seq < old_state["watermark_seq"]
+            # shared number is taken from the new source despite lower revision
+            assert rt.store.get_cert("json-lab", "C-1001")["revision"] == 1
+            # late old-source writes cannot land on the new catalog
+            world.add_cert("C-9977", {"instrument": "old ghost"})
+            time.sleep(0.3)
+            assert all(
+                c["cert_no"] != "C-9977"
+                for c in rt.store.list_certs("json-lab", page=1, page_size=500)["items"]
+            )
+            # the pre-switch export keeps its frozen pages
+            page = rt.store.export_page(export["token"], 1)
+            assert page["catalog_version"] == frozen_version and page["total"] == frozen_total
+            # incremental collection resumes against the new source
+            alt.add_cert("C-A001", {"instrument": "post switch"})
+            _wait(
+                lambda: rt.store.get_state("json-lab")["cert_count"] == len(alt.state()["certs"])
+                and rt.store.get_state("json-lab")["caught_up"],
+                timeout=20,
+            )
+            # switch back so later checks keep exercising the JSON body
+            rt.engine.request_switch(
+                "json-lab", {"kind": "json", "base_url": "http://sim.local/json", "timeout": 20}
+            )
+            _wait(
+                lambda: rt.store.get_state("json-lab")["cert_count"] == len(world.state()["certs"])
+                and rt.store.get_state("json-lab")["caught_up"],
+                timeout=30,
+            )
+            return (
+                f"epoch {old_state['active_epoch']} -> {after['active_epoch']}, "
+                f"{after['cert_count']} certs, frozen export intact, switched back"
+            )
+
+        _check("online source switch cuts over atomically and rejects late old writes", source_switch, results)
+
         def history_expiry():
             from .source import build_adapter
 

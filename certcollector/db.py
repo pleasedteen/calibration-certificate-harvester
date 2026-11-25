@@ -46,7 +46,9 @@ SCHEMA = [
         finished_at TEXT,
         updated_at TEXT NOT NULL,
         heartbeat_at TEXT,
-        request_key TEXT
+        request_key TEXT,
+        source_epoch BIGINT NOT NULL DEFAULT 0,
+        switch_id TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_runs_org ON runs(org_id, requested_at)",
@@ -70,7 +72,8 @@ SCHEMA = [
         expires_at TEXT,
         error TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        source_epoch BIGINT NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_scans_org ON scans(org_id, status)",
@@ -115,9 +118,25 @@ SCHEMA = [
         source_head_seq BIGINT NOT NULL DEFAULT -1,
         cert_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        active_epoch BIGINT NOT NULL DEFAULT 0
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS source_switch (
+        switch_id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        source_config TEXT NOT NULL,
+        from_epoch BIGINT NOT NULL DEFAULT 0,
+        to_epoch BIGINT NOT NULL,
+        status TEXT NOT NULL,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_switch_org ON source_switch(org_id, status)",
     """
     CREATE TABLE IF NOT EXISTS pending_corrections (
         org_id TEXT NOT NULL,
@@ -319,6 +338,35 @@ class Database:
         with self.transaction(write=True) as tx:
             tx.executemany(self._translate(sql), rows)
 
+    def _table_columns(self, table: str) -> set[str]:
+        if self.is_postgres:
+            rows = self.query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=?",
+                (table,),
+            )
+            return {r["column_name"] for r in rows}
+        rows = self.query(f"PRAGMA table_info({table})")
+        return {r["name"] for r in rows}
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to older databases."""
+        additions = {
+            "runs": (
+                ("source_epoch", "BIGINT NOT NULL DEFAULT 0"),
+                ("switch_id", "TEXT"),
+            ),
+            "scans": (("source_epoch", "BIGINT NOT NULL DEFAULT 0"),),
+            "catalog_state": (("active_epoch", "BIGINT NOT NULL DEFAULT 0"),),
+        }
+        for table, columns in additions.items():
+            existing = self._table_columns(table)
+            if not existing:
+                continue
+            for name, decl in columns:
+                if name not in existing:
+                    with self.transaction(write=True) as tx:
+                        tx.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
     def create_schema(self) -> None:
         if self.is_postgres:
             with self.transaction(write=True) as tx:
@@ -328,6 +376,7 @@ class Database:
             c = self.conn()
             for ddl in SCHEMA:
                 c.execute(ddl)
+        self._migrate()
 
 
 class _SqliteTx:

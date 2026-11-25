@@ -27,8 +27,10 @@ class SimServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 0, seed: int = 7, count: int = 20):
         self.html_world = World("html", count=count, seed=seed)
         self.json_world = World("json", count=count, seed=seed + 1)
+        self.alt_world = World("alt", count=max(1, count // 4), seed=seed + 2)
         self.html_site = HtmlSite(self.html_world)
         self.json_site = JsonSite(self.json_world)
+        self.alt_site = JsonSite(self.alt_world)
         self.httpd = ThreadingHTTPServer((host, port), self._handler_class())
         self.httpd.daemon_threads = True
         self.host, self.port = self.httpd.server_address[:2]
@@ -39,7 +41,11 @@ class SimServer:
         return f"http://{self.host}:{self.port}"
 
     def urls(self) -> dict[str, str]:
-        return {"html": self.base_url, "json": self.base_url + "/json"}
+        return {
+            "html": self.base_url,
+            "json": self.base_url + "/json",
+            "alt": self.base_url + "/alt",
+        }
 
     def route(self, request: dict[str, Any]):
         path = request["path"]
@@ -47,6 +53,10 @@ class SimServer:
             inner = dict(request)
             inner["path"] = path[len("/json") :] or "/"
             return self.json_site.handle(inner)
+        if path.startswith("/alt"):
+            inner = dict(request)
+            inner["path"] = path[len("/alt") :] or "/"
+            return self.alt_site.handle(inner)
         return self.html_site.handle(request)
 
     def _handler_class(self):

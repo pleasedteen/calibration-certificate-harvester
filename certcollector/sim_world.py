@@ -119,6 +119,9 @@ class World:
             "auto_update_ms": 0,
             "fail_requests": 0,
         }
+        # When disabled every request fails as if the whole body were offline;
+        # durable state is untouched so enabling it again restores service.
+        self.enabled = True
         self._active = 0
         self._peak_active = 0
         self._last_request = 0.0
@@ -611,6 +614,7 @@ class World:
                     }
                 ),
                 "config": dict(self.config),
+                "enabled": self.enabled,
                 "counters": dict(self.counters),
                 "active_requests": self._active,
                 "snapshots": len(self.snapshots),
@@ -623,6 +627,11 @@ class World:
                     self.config[key] = value
             self.cursor_epoch = 0.0
             return dict(self.config)
+
+    def set_enabled(self, enabled: bool) -> dict[str, Any]:
+        with self.lock:
+            self.enabled = bool(enabled)
+            return {"site": self.site, "enabled": self.enabled}
 
     def expire_all(self) -> None:
         with self.lock:
@@ -639,6 +648,7 @@ class World:
     def reset(self, count: int = 20) -> None:
         with self.lock:
             self.stop_auto_updates()
+            self.enabled = True
             self.seq = 0
             self.events.clear()
             self.certs.clear()
@@ -677,6 +687,9 @@ class World:
         with self.lock:
             now = time.time()
             self.counters["requests"] += 1
+            if not self.enabled:
+                self.counters["failures_injected"] += 1
+                return 503, 0.05, 0.0
             max_conc = int(self.config["max_concurrency"])
             interval = float(self.config["min_interval_ms"]) / 1000.0
             retry = float(self.config["retry_after"])

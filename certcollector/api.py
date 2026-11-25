@@ -178,6 +178,13 @@ class Api:
             return 201, self.store.create_export(org_id, page_size, ttl)
         if action == "corrections" and method == "GET":
             return {"items": self.store.list_pending_corrections(org_id)}
+        if action == "switches" and method == "GET":
+            if len(rest) == 1:
+                return {"items": [self._switch_summary(s) for s in self.store.list_switches(org_id)]}
+            switch = self.store.get_switch(rest[1])
+            if switch["org_id"] != org_id:
+                raise NotFound("switch not found", details={"switch_id": rest[1]})
+            return self._switch_summary(switch)
         return 404, {"error": "not_found"}
 
     def _exports(self, method: str, parts: list[str], query: dict[str, str]):  # noqa: ARG002
@@ -233,6 +240,30 @@ class Api:
             pass
         if existing and body.get("reject_existing"):
             raise Conflict("organization already exists", details={"org_id": org_id})
+        source_changed = bool(existing) and existing.get("source") != source
+        if source_changed:
+            pending = self.store.get_pending_switch(org_id)
+            if pending is not None:
+                raise Conflict(
+                    "a source switch is already in progress",
+                    details={"switch_id": pending["switch_id"]},
+                )
+            # Non-source settings still take effect immediately; the source
+            # column itself is only swapped at the atomic cutover.
+            self.store.upsert_org(
+                org_id,
+                name,
+                existing["source"],
+                limits,
+                options,
+            )
+            self.engine.runtime(org_id)
+            self.engine._ensure_lanes(org_id)
+            switch = self.engine.request_switch(org_id, source)
+            return 202, {
+                **self._org_summary(self.store.get_org(org_id)),
+                "source_switch": self._switch_summary(switch),
+            }
         org = self.store.upsert_org(org_id, name, source, limits, options)
         self.engine.runtime(org_id)
         self.engine._ensure_lanes(org_id)
@@ -242,12 +273,29 @@ class Api:
                 self.engine.request_full(org_id, "initial")
         return (201 if existing is None else 200), self._org_summary(org)
 
+    @staticmethod
+    def _switch_summary(switch: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "switch_id": switch["switch_id"],
+            "status": switch["status"],
+            "from_epoch": switch["from_epoch"],
+            "to_epoch": switch["to_epoch"],
+            "source": switch["source"],
+            "run_id": switch["run_id"],
+            "created_at": switch["created_at"],
+            "finished_at": switch["finished_at"],
+        }
+
     def _org_detail(self, org_id: str) -> dict[str, Any]:
         org = self.store.get_org(org_id)
         state = self.store.get_state(org_id)
+        pending = self.store.get_pending_switch(org_id)
         return {
             **self._org_summary(org),
             "catalog": state,
+            "source_epoch": state["active_epoch"],
+            "pending_switch": self._switch_summary(pending) if pending else None,
+            "recent_switches": [self._switch_summary(s) for s in self.store.list_switches(org_id, limit=5)],
             "pending_corrections": self.store.list_pending_corrections(org_id),
         }
 
@@ -272,7 +320,10 @@ class Api:
         active = [r for r in runs if r["status"] in ("queued", "running", "paused")]
         latest = self.store.latest_scan(org_id)
         runtime = self.engine.runtime_state(org_id)
-        if not state["ready"]:
+        pending_switch = self.store.get_pending_switch(org_id)
+        if pending_switch:
+            phase = "switching"
+        elif not state["ready"]:
             phase = "initializing"
         elif org["paused"]:
             phase = "paused"
@@ -298,6 +349,8 @@ class Api:
             "ready": state["ready"],
             "paused": org["paused"],
             "enabled": org["enabled"],
+            "source_epoch": state["active_epoch"],
+            "pending_switch": self._switch_summary(pending_switch) if pending_switch else None,
             "catalog": {
                 "version": state["version"],
                 "published_at": state["published_at"],

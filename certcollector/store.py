@@ -130,6 +130,7 @@ class Store:
             "cert_count": int(row["cert_count"]),
             "last_error": loads(row["last_error"]) if row["last_error"] else None,
             "updated_at": row["updated_at"],
+            "active_epoch": int(row["active_epoch"]),
             "caught_up": int(row["watermark_seq"]) >= int(row["source_head_seq"])
             and int(row["source_head_seq"]) >= 0,
         }
@@ -182,11 +183,19 @@ class Store:
         head_cursor: str | None,
         head_seq: int,
         run_id: str | None = None,
+        source_epoch: int | None = None,
+        switch_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Atomically replace the published catalog.
 
         Returns ``None`` when the swap would move the watermark backwards; in
         that case nothing is written and the caller must catch up first.
+
+        A source switch (``switch_id`` given) replaces the catalog of a
+        *different* upstream: sequence numbers and revisions are not comparable
+        across sources, so the monotonic guards are scoped to the source epoch
+        and the whole cutover (catalog, watermarks, continuation position and
+        active source config) is committed in one transaction.
         """
         if watermark_seq < 0:
             return None
@@ -196,8 +205,26 @@ class Store:
             )
             if state is None:
                 raise NotFound("catalog state not found")
-            if int(watermark_seq) < int(state["watermark_seq"]):
-                return None
+            active_epoch = int(state["active_epoch"])
+            is_switch = switch_id is not None
+            if is_switch:
+                switch = tx.fetchone(
+                    self.db._translate("SELECT * FROM source_switch WHERE switch_id=?"),
+                    (switch_id,),
+                )
+                if switch is None or switch["org_id"] != org_id or switch["status"] != "pending":
+                    # already cut over or abandoned: a late switch result is a no-op
+                    return None
+                if source_epoch is None or int(source_epoch) <= active_epoch:
+                    return None
+                target_epoch = int(source_epoch)
+            else:
+                if source_epoch is not None and int(source_epoch) != active_epoch:
+                    # a rebuild staged against a source that has since been replaced
+                    return None
+                target_epoch = active_epoch
+                if int(watermark_seq) < int(state["watermark_seq"]):
+                    return None
             # Rows not in the snapshot must leave the catalog, but the delete is
             # expressed after the upserts so the monotonic guard above decides
             # which version of a shared number survives.
@@ -210,29 +237,39 @@ class Store:
                 )
             }
             rows = [self._cert_row_tuple(org_id, e, watermark_seq) for e in entries]
-            if rows:
-                tx.executemany(self.db._translate(self.CERT_INSERT), rows)
-            # A row written by a newer incremental window (source_seq beyond the
-            # snapshot's position) is current and must not be dropped by a
-            # rebuild that has not seen it yet.
-            stale = sorted(
-                no
-                for no, seq in existing.items()
-                if no not in snapshot_nos and seq <= int(watermark_seq)
-            )
-            if stale:
-                tx.executemany(
-                    self.db._translate("DELETE FROM certs WHERE org_id=? AND cert_no=?"),
-                    [(org_id, no) for no in stale],
+            if is_switch:
+                # Different source: every old row is obsolete, including shared
+                # certificate numbers that carry higher revisions/seqs from the
+                # previous source.  The new source's snapshot is authoritative.
+                tx.execute(
+                    self.db._translate("DELETE FROM certs WHERE org_id=?"), (org_id,)
                 )
+                if rows:
+                    tx.executemany(self.db._translate(self.SWITCH_CERT_INSERT), rows)
+            else:
+                if rows:
+                    tx.executemany(self.db._translate(self.CERT_INSERT), rows)
+                # A row written by a newer incremental window (source_seq beyond the
+                # snapshot's position) is current and must not be dropped by a
+                # rebuild that has not seen it yet.
+                stale = sorted(
+                    no
+                    for no, seq in existing.items()
+                    if no not in snapshot_nos and seq <= int(watermark_seq)
+                )
+                if stale:
+                    tx.executemany(
+                        self.db._translate("DELETE FROM certs WHERE org_id=? AND cert_no=?"),
+                        [(org_id, no) for no in stale],
+                    )
             now = _now()
             version = int(state["version"]) + 1
             tx.execute(
                 self.db._translate(
                     "UPDATE catalog_state SET version=?, ready=1, published_at=?, "
                     "watermark_cursor=?, watermark_seq=?, source_head_cursor=?, "
-                    "source_head_seq=?, cert_count=?, last_error=NULL, updated_at=? "
-                    "WHERE org_id=?"
+                    "source_head_seq=?, cert_count=?, last_error=NULL, updated_at=?, "
+                    "active_epoch=? WHERE org_id=?"
                 ),
                 (
                     version,
@@ -243,15 +280,49 @@ class Store:
                     int(head_seq),
                     len(entries),
                     now,
+                    target_epoch,
                     org_id,
                 ),
             )
+            if is_switch:
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE source_switch SET status='completed', finished_at=?, updated_at=? "
+                        "WHERE switch_id=?"
+                    ),
+                    (now, now, switch_id),
+                )
+                tx.execute(
+                    self.db._translate(
+                        "UPDATE orgs SET source_config=?, updated_at=? WHERE org_id=?"
+                    ),
+                    (switch["source_config"], now, org_id),
+                )
+                # pending corrections were keyed to the old source's change feed
+                tx.execute(
+                    self.db._translate("DELETE FROM pending_corrections WHERE org_id=?"),
+                    (org_id,),
+                )
             return {
                 "version": version,
                 "published_at": now,
                 "cert_count": len(entries),
                 "watermark_seq": int(watermark_seq),
+                "active_epoch": target_epoch,
             }
+
+    # Across a source switch the new source is authoritative even when a shared
+    # certificate number carries a lower revision there: no revision guard.
+    SWITCH_CERT_INSERT = (
+        "INSERT INTO certs(org_id,cert_no,revision,status,payload,source_updated_at,"
+        "revoked_at,correction_id,correction,local_updated_at,source_seq) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(org_id, cert_no) DO UPDATE SET "
+        "revision=excluded.revision, status=excluded.status, payload=excluded.payload, "
+        "source_updated_at=excluded.source_updated_at, revoked_at=excluded.revoked_at, "
+        "correction_id=excluded.correction_id, correction=excluded.correction, "
+        "local_updated_at=excluded.local_updated_at, source_seq=excluded.source_seq"
+    )
 
     def publish_incremental(
         self,
@@ -263,6 +334,7 @@ class Store:
         watermark_seq: int,
         head_cursor: str | None,
         head_seq: int,
+        source_epoch: int | None = None,
     ) -> dict[str, Any] | None:
         with self.db.transaction(write=True) as tx:
             state = tx.fetchone(
@@ -270,6 +342,11 @@ class Store:
             )
             if state is None:
                 raise NotFound("catalog state not found")
+            # A window staged against the previously active source must never be
+            # written back after a source switch cut over: its cursor belongs to
+            # the old upstream and the new catalog has its own watermark.
+            if source_epoch is not None and int(source_epoch) != int(state["active_epoch"]):
+                return None
             current_wm = int(state["watermark_seq"])
             if watermark_seq < current_wm:
                 # A concurrent rebuild/catch-up already published newer state;
@@ -390,8 +467,12 @@ class Store:
         *,
         request_key: str | None = None,
         coalesce_incremental: bool = True,
+        source_epoch: int | None = None,
+        switch_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Create or reuse a run.  Returns ``(run, coalesced)``."""
+        if source_epoch is None:
+            source_epoch = self.get_state(org_id)["active_epoch"]
         with self.db.transaction(write=True) as tx:
             if request_key:
                 existing = tx.fetchone(
@@ -414,9 +495,23 @@ class Store:
             tx.execute(
                 self.db._translate(
                     "INSERT INTO runs(run_id,org_id,kind,trigger,status,phase,progress,"
-                    "requested_at,updated_at,request_key) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                    "requested_at,updated_at,request_key,source_epoch,switch_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
                 ),
-                (run_id, org_id, kind, trigger, "queued", "queued", dumps({}), now, now, request_key),
+                (
+                    run_id,
+                    org_id,
+                    kind,
+                    trigger,
+                    "queued",
+                    "queued",
+                    dumps({}),
+                    now,
+                    now,
+                    request_key,
+                    int(source_epoch),
+                    switch_id,
+                ),
             )
             row = tx.fetchone(self.db._translate("SELECT * FROM runs WHERE run_id=?"), (run_id,))
             return self._run_view(row), False
@@ -440,6 +535,8 @@ class Store:
             "finished_at": row["finished_at"],
             "updated_at": row["updated_at"],
             "heartbeat_at": row["heartbeat_at"],
+            "source_epoch": int(row["source_epoch"]),
+            "switch_id": row["switch_id"],
         }
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -461,10 +558,13 @@ class Store:
     def claim_next_run(self, org_id: str, kinds: tuple[str, ...]) -> dict[str, Any] | None:
         placeholders = ",".join("?" for _ in kinds)
         with self.db.transaction(write=True) as tx:
+            # A pending source switch must be worked on ahead of any ordinary
+            # queued rebuild of the same org.
             row = tx.fetchone(
                 self.db._translate(
                     f"SELECT * FROM runs WHERE org_id=? AND status='queued' "
-                    f"AND kind IN ({placeholders}) ORDER BY requested_at LIMIT 1"
+                    f"AND kind IN ({placeholders}) "
+                    f"ORDER BY CASE WHEN switch_id IS NOT NULL THEN 0 ELSE 1 END, requested_at LIMIT 1"
                 ),
                 (org_id, *kinds),
             )
@@ -483,6 +583,48 @@ class Store:
                 self.db._translate("SELECT * FROM runs WHERE run_id=?"), (row["run_id"],)
             )
             return self._run_view(fresh)
+
+    def supersede_runs_for_epoch(
+        self, org_id: str, epoch: int, *, keep_run_id: str | None = None
+    ) -> int:
+        """Mark still-active runs of an older source epoch as superseded.
+
+        Runs already in flight are left for their lanes to abort at the next
+        guard; only queued/paused work is retired here so it never starts
+        against the replaced source.
+        """
+        with self.db.transaction(write=True) as tx:
+            sql = (
+                "UPDATE runs SET status='superseded', reason='source_switched', "
+                "finished_at=?, updated_at=? WHERE org_id=? AND source_epoch<? "
+                "AND status IN ('queued','paused')"
+            )
+            params: list[Any] = [_now(), _now(), org_id, int(epoch)]
+            if keep_run_id:
+                sql += " AND run_id<>?"
+                params.append(keep_run_id)
+            cur = tx.execute(self.db._translate(sql), tuple(params))
+            return int(cur.rowcount or 0)
+
+    def has_active_switch_run(self, org_id: str, switch_id: str | None = None) -> bool:
+        with self.db.transaction(write=False) as tx:
+            if switch_id:
+                row = tx.fetchone(
+                    self.db._translate(
+                        "SELECT COUNT(*) AS n FROM runs WHERE org_id=? AND switch_id=? "
+                        "AND status IN ('queued','running','paused')"
+                    ),
+                    (org_id, switch_id),
+                )
+            else:
+                row = tx.fetchone(
+                    self.db._translate(
+                        "SELECT COUNT(*) AS n FROM runs WHERE org_id=? AND switch_id IS NOT NULL "
+                        "AND status IN ('queued','running','paused')"
+                    ),
+                    (org_id,),
+                )
+            return bool(row and int(row["n"]))
 
     def has_active_run(self, org_id: str, kinds: tuple[str, ...]) -> bool:
         placeholders = ",".join("?" for _ in kinds)
@@ -598,16 +740,20 @@ class Store:
 
     # ------------------------------------------------------------------
     # scans (staged full scans)
-    def create_scan(self, org_id: str, run_id: str, kind: str) -> dict[str, Any]:
+    def create_scan(
+        self, org_id: str, run_id: str, kind: str, source_epoch: int | None = None
+    ) -> dict[str, Any]:
         scan_id = uuid.uuid4().hex
         now = _now()
+        if source_epoch is None:
+            source_epoch = self.get_state(org_id)["active_epoch"]
         with self.db.transaction(write=True) as tx:
             tx.execute(
                 self.db._translate(
-                    "INSERT INTO scans(scan_id,org_id,run_id,kind,status,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?)"
+                    "INSERT INTO scans(scan_id,org_id,run_id,kind,status,created_at,updated_at,"
+                    "source_epoch) VALUES (?,?,?,?,?,?,?,?)"
                 ),
-                (scan_id, org_id, run_id, kind, "listing", now, now),
+                (scan_id, org_id, run_id, kind, "listing", now, now, int(source_epoch)),
             )
             row = tx.fetchone(self.db._translate("SELECT * FROM scans WHERE scan_id=?"), (scan_id,))
             return self._scan_view(row)
@@ -633,6 +779,7 @@ class Store:
             "error": loads(row["error"]) if row["error"] else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "source_epoch": int(row["source_epoch"]),
         }
 
     def get_scan(self, scan_id: str) -> dict[str, Any]:
@@ -642,10 +789,12 @@ class Store:
         return self._scan_view(row)
 
     def find_scan_for_run(self, run_id: str) -> dict[str, Any] | None:
+        run = self.db.query_one("SELECT source_epoch FROM runs WHERE run_id=?", (run_id,))
+        epoch = int(run["source_epoch"]) if run else 0
         row = self.db.query_one(
             "SELECT * FROM scans WHERE run_id=? AND status NOT IN ('failed','published') "
-            "ORDER BY created_at DESC LIMIT 1",
-            (run_id,),
+            "AND source_epoch=? ORDER BY created_at DESC LIMIT 1",
+            (run_id, epoch),
         )
         return self._scan_view(row) if row else None
 
@@ -927,6 +1076,102 @@ class Store:
         )
 
     # ------------------------------------------------------------------
+    # source switches
+    def create_switch(
+        self,
+        org_id: str,
+        source: dict[str, Any],
+        *,
+        from_epoch: int,
+        to_epoch: int,
+        run_id: str,
+    ) -> dict[str, Any]:
+        switch_id = uuid.uuid4().hex
+        now = _now()
+        with self.db.transaction(write=True) as tx:
+            tx.execute(
+                self.db._translate(
+                    "INSERT INTO source_switch(switch_id,org_id,source_config,from_epoch,to_epoch,"
+                    "status,run_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+                ),
+                (
+                    switch_id,
+                    org_id,
+                    dumps(source),
+                    int(from_epoch),
+                    int(to_epoch),
+                    "pending",
+                    run_id,
+                    now,
+                    now,
+                ),
+            )
+            row = tx.fetchone(
+                self.db._translate("SELECT * FROM source_switch WHERE switch_id=?"), (switch_id,)
+            )
+            return self._switch_view(row)
+
+    def get_switch(self, switch_id: str) -> dict[str, Any]:
+        row = self.db.query_one("SELECT * FROM source_switch WHERE switch_id=?", (switch_id,))
+        if row is None:
+            raise NotFound("source switch not found", details={"switch_id": switch_id})
+        return self._switch_view(row)
+
+    def get_pending_switch(self, org_id: str) -> dict[str, Any] | None:
+        row = self.db.query_one(
+            "SELECT * FROM source_switch WHERE org_id=? AND status='pending' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (org_id,),
+        )
+        return self._switch_view(row) if row else None
+
+    def list_switches(self, org_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM source_switch WHERE org_id=? ORDER BY created_at DESC LIMIT ?",
+            (org_id, limit),
+        )
+        return [self._switch_view(r) for r in rows]
+
+    def list_pending_switches(self) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM source_switch WHERE status='pending' ORDER BY created_at"
+        )
+        return [self._switch_view(r) for r in rows]
+
+    def update_switch(self, switch_id: str, *, status: str | None = None, run_id: str | None = None):
+        sets = ["updated_at=?"]
+        params: list[Any] = [_now()]
+        if status is not None:
+            sets.append("status=?")
+            params.append(status)
+            if status in ("completed", "failed", "abandoned"):
+                sets.append("finished_at=?")
+                params.append(_now())
+        if run_id is not None:
+            sets.append("run_id=?")
+            params.append(run_id)
+        params.append(switch_id)
+        self.execute_checked(
+            f"UPDATE source_switch SET {','.join(sets)} WHERE switch_id=?", params
+        )
+        return self.get_switch(switch_id)
+
+    @staticmethod
+    def _switch_view(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "switch_id": row["switch_id"],
+            "org_id": row["org_id"],
+            "source": loads(row["source_config"], {}),
+            "from_epoch": int(row["from_epoch"]),
+            "to_epoch": int(row["to_epoch"]),
+            "status": row["status"],
+            "run_id": row["run_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "finished_at": row["finished_at"],
+        }
+
+    # ------------------------------------------------------------------
     # exports
     def create_export(
         self, org_id: str, page_size: int, ttl_seconds: int
@@ -1118,6 +1363,19 @@ class Store:
                     tx.execute(self.db._translate("DELETE FROM scan_items WHERE scan_id=?"), (row["scan_id"],))
                     tx.execute(self.db._translate("DELETE FROM scans WHERE scan_id=?"), (row["scan_id"],))
                     removed["scans"] += 1
+                # finished source switches only need to linger long enough to
+                # answer status questions; pending ones are always retained.
+                finished_switches = tx.fetchall(
+                    self.db._translate(
+                        "SELECT switch_id FROM source_switch WHERE status<>'pending' "
+                        "ORDER BY updated_at DESC"
+                    )
+                )
+                for row in finished_switches[run_keep:]:
+                    tx.execute(
+                        self.db._translate("DELETE FROM source_switch WHERE switch_id=?"),
+                        (row["switch_id"],),
+                    )
         # also prune orphaned scan staging that is old and no longer referenced
         return removed
 
@@ -1125,7 +1383,17 @@ class Store:
     # diagnostics
     def storage_counts(self) -> dict[str, int]:
         counts = {}
-        for table in ("orgs", "runs", "scans", "scan_items", "certs", "exports", "export_items", "pending_corrections"):
+        for table in (
+            "orgs",
+            "runs",
+            "scans",
+            "scan_items",
+            "certs",
+            "exports",
+            "export_items",
+            "pending_corrections",
+            "source_switch",
+        ):
             row = self.db.query_one(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = int(row["n"]) if row else 0
         return counts

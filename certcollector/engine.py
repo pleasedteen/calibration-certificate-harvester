@@ -34,6 +34,7 @@ from .source import ChangePage, Detail, build_adapter
 from .store import Store
 from .util import (
     ChannelExpired,
+    Conflict,
     NotFound,
     RateLimited,
     SourceUnavailable,
@@ -61,6 +62,15 @@ class ScanExpired(Exception):
 
 class RebuildContended(Exception):
     pass
+
+
+class StaleEpoch(Exception):
+    """A run/scan belongs to a source epoch that has already been replaced."""
+
+    def __init__(self, run_epoch: int, active_epoch: int):
+        super().__init__(f"stale source epoch {run_epoch} (active {active_epoch})")
+        self.run_epoch = run_epoch
+        self.active_epoch = active_epoch
 
 
 class IncompleteCorrection(Exception):
@@ -132,6 +142,7 @@ class OrgRuntime:
         self.org_id = org_id
         self._lock = threading.RLock()
         self._adapter = None
+        self._adapters: dict[str, Any] = {}
         self._source_key: str | None = None
         self._wait: WaitState | None = None
         self._cooldown_until = 0.0
@@ -176,10 +187,28 @@ class OrgRuntime:
                 self._source_key = key
             return self._adapter
 
+    def adapter_for(self, source: dict[str, Any], options: dict[str, Any] | None = None):
+        """Build (and cache) an adapter for an explicit source configuration.
+
+        Switch runs talk to the *target* source while the organization row still
+        points at the active source, so their adapter cannot come from
+        :meth:`adapter`.
+        """
+        options = options or {}
+        key = dumps({"source": source, "page_size": options.get("page_size")})
+        with self._lock:
+            cached = self._adapters.get(key)
+            if cached is None:
+                source_config = {**source, "page_size": options.get("page_size", 10)}
+                cached = self.engine.build_adapter(source_config)
+                self._adapters[key] = cached
+            return cached
+
     def invalidate(self) -> None:
         with self._lock:
             self._adapter = None
             self._source_key = None
+            self._adapters.clear()
 
     # -- wait reporting --------------------------------------------------
     def set_wait(self, reason: str | None, seconds: float = 0.0, detail: dict[str, Any] | None = None):
@@ -267,10 +296,10 @@ class OrgRuntime:
                 # back into the limit
                 self._adaptive_interval = max(0.005, self._adaptive_interval * 0.9 - 0.005)
 
-    def call(self, fn: Callable, *args, **kwargs):
+    def call(self, fn: Callable, *args, adapter: Any = None, **kwargs):
         """Invoke a source operation honouring pacing, retries and Retry-After."""
         org = self.org()
-        adapter = self.adapter(org)
+        adapter = adapter or self.adapter(org)
         attempts = int((org.get("options") or {}).get("request_attempts", 4))
         last: Exception | None = None
         for attempt in range(attempts):
@@ -401,11 +430,31 @@ class Engine:
                 for org in orgs:
                     org_id = org["org_id"]
                     self._ensure_lanes(org_id)
+                    self._recover_pending_switch(org_id)
                     if org["enabled"] and not org["paused"]:
                         self._maybe_schedule(org)
             except Exception:  # pragma: no cover - defensive
                 log.exception("supervisor iteration failed")
             self.stop_event.wait(0.2)
+
+    def _recover_pending_switch(self, org_id: str) -> None:
+        """Ensure every pending switch still has a run that will complete it."""
+        switch = self.store.get_pending_switch(org_id)
+        if switch is None:
+            return
+        if self.store.has_active_switch_run(org_id, switch["switch_id"]):
+            return
+        run, _ = self.store.create_run(
+            org_id,
+            FULL,
+            "switch_retry",
+            coalesce_incremental=False,
+            source_epoch=switch["to_epoch"],
+            switch_id=switch["switch_id"],
+        )
+        self.store.update_switch(switch["switch_id"], run_id=run["run_id"])
+        self.store.supersede_runs_for_epoch(org_id, switch["to_epoch"], keep_run_id=run["run_id"])
+        self.runtime(org_id).invalidate()
 
     def _maybe_schedule(self, org: dict[str, Any]) -> None:
         org_id = org["org_id"]
@@ -428,8 +477,15 @@ class Engine:
             ]
             if failed_full:
                 self._full_backoff[org_id] = now
-                self.store.create_run(org_id, FULL, "auto_retry", coalesce_incremental=False)
+                if self.store.get_pending_switch(org_id) is not None:
+                    self._recover_pending_switch(org_id)
+                else:
+                    self.store.create_run(org_id, FULL, "auto_retry", coalesce_incremental=False)
             return
+        # A pending cutover does not stop the *active* source's incremental
+        # channel: those runs bind to the current epoch and keep the published
+        # catalog fresh until the switch transaction replaces it.  The switch
+        # run itself is a full run and is recovered separately above.
         has_incremental = self.store.has_active_run(org_id, (INCREMENTAL,))
         last_auto = self._last_auto.get(org_id)
         if not has_incremental and (last_auto is None or (now - last_auto) * 1000.0 >= poll_ms):
@@ -450,16 +506,77 @@ class Engine:
         org = self.store.get_org(org_id)
         if not org["enabled"]:
             raise RunAborted("disabled")
-        run, coalesced = self.store.create_run(
-            org_id, FULL, trigger, request_key=request_key, coalesce_incremental=False
-        )
+        switch = self.store.get_pending_switch(org_id)
+        if switch is not None and trigger != "switch":
+            # While a cutover is pending, ordinary rebuilds join the switch and
+            # target the new source rather than the old one.
+            run, _ = self.store.create_run(
+                org_id,
+                FULL,
+                trigger,
+                request_key=request_key,
+                coalesce_incremental=False,
+                source_epoch=switch["to_epoch"],
+                switch_id=switch["switch_id"],
+            )
+            coalesced = False
+        else:
+            run, coalesced = self.store.create_run(
+                org_id,
+                FULL,
+                trigger,
+                request_key=request_key,
+                coalesce_incremental=False,
+            )
         self.runtime(org_id)
         self._ensure_lanes(org_id)
-        return {**run, "coalesced": coalesced}
+        return {**self.store.get_run(run["run_id"]), "coalesced": coalesced}
+
+    def request_switch(self, org_id: str, source: dict[str, Any]) -> dict[str, Any]:
+        """Begin an online cutover to a different upstream source.
+
+        The active catalog and its incremental channel keep serving the old
+        source until a full scan of the new source publishes atomically.
+        """
+        # raises NotFound for an unknown organization
+        self.store.get_org(org_id)
+        pending = self.store.get_pending_switch(org_id)
+        if pending is not None:
+            raise Conflict(
+                "a source switch is already in progress",
+                details={"switch_id": pending["switch_id"]},
+            )
+        state = self.store.get_state(org_id)
+        from_epoch = int(state["active_epoch"])
+        to_epoch = from_epoch + 1
+        run, _ = self.store.create_run(
+            org_id,
+            FULL,
+            "switch",
+            coalesce_incremental=False,
+            source_epoch=to_epoch,
+        )
+        switch = self.store.create_switch(
+            org_id,
+            source,
+            from_epoch=from_epoch,
+            to_epoch=to_epoch,
+            run_id=run["run_id"],
+        )
+        self.store.execute_checked(
+            "UPDATE runs SET switch_id=? WHERE run_id=?", (switch["switch_id"], run["run_id"])
+        )
+        # queued/paused old-source work must never start against the new source
+        self.store.supersede_runs_for_epoch(org_id, to_epoch, keep_run_id=run["run_id"])
+        self.runtime(org_id).invalidate()
+        self._ensure_lanes(org_id)
+        return self.store.get_switch(switch["switch_id"])
 
     def request_incremental(self, org_id: str, trigger: str = "manual", request_key: str | None = None) -> dict[str, Any]:
         state = self.store.get_state(org_id)
-        run, coalesced = self.store.create_run(org_id, INCREMENTAL, trigger, request_key=request_key)
+        run, coalesced = self.store.create_run(
+            org_id, INCREMENTAL, trigger, request_key=request_key
+        )
         if not state["ready"] and not coalesced:
             self.store.finish_run(
                 run["run_id"],
@@ -499,15 +616,22 @@ class Engine:
                     self.runtime(org_id).set_wait(None)
                     self.stop_event.wait(0.12)
                     continue
+                if self._run_is_stale(run):
+                    self._retire_stale_run(run)
+                    continue
                 rt = self.runtime(org_id)
                 try:
                     if kind == FULL:
                         self._run_full(rt, run)
                     else:
                         self._run_incremental(rt, run)
+                except StaleEpoch:
+                    self._retire_stale_run(run)
                 except RunAborted as exc:
                     self._handle_abort(run, exc.reason)
-                except Exception as exc:  # pragma: no cover - defensive
+                except Exception as exc:
+                    if run.get("switch_id") and self._requeue_failed_switch(run, exc):
+                        return
                     log.exception("run %s failed", run["run_id"])
                     self.store.finish_run(
                         run["run_id"], "failed", error={"code": "internal_error", "message": str(exc)}
@@ -515,6 +639,43 @@ class Engine:
             except Exception:  # pragma: no cover - defensive
                 log.exception("lane loop error for %s", org_id)
                 self.stop_event.wait(0.5)
+
+    def _run_is_stale(self, run: dict[str, Any]) -> bool:
+        """A run bound to a source epoch that is no longer current."""
+        state = self.store.get_state(run["org_id"])
+        active = int(state["active_epoch"])
+        run_epoch = int(run["source_epoch"])
+        if run["switch_id"]:
+            switch = self.store.get_pending_switch(run["org_id"])
+            if switch is None or switch["switch_id"] != run["switch_id"]:
+                return True
+            return False
+        return run_epoch != active
+
+    def _retire_stale_run(self, run: dict[str, Any]) -> None:
+        current = self.store.get_run(run["run_id"])
+        if current["status"] in ("succeeded", "failed", "cancelled", "superseded"):
+            return
+        self.store.finish_run(
+            run["run_id"],
+            "superseded",
+            error={
+                "code": "source_switched",
+                "message": "run belonged to a source that has been replaced",
+            },
+        )
+
+    def _requeue_failed_switch(self, run: dict[str, Any], exc: Exception) -> bool:
+        """Keep a pending switch retrying while its target source is unhealthy.
+
+        The previous source keeps serving throughout, so a failed switch
+        attempt is retried with bounded back-off instead of terminating the
+        cutover.  Returns ``False`` once the switch itself is no longer pending.
+        """
+        return self._fail_or_retry_switch(
+            run,
+            {"code": getattr(exc, "code", "upstream_error"), "message": str(exc)},
+        )
 
     def _full_lane(self, org_id: str) -> None:
         self._lane_loop(org_id, FULL)
@@ -533,19 +694,62 @@ class Engine:
         else:
             self.store.requeue_run(run["run_id"], reason="engine_stopped", status="queued")
 
+    def _fail_or_retry_switch(self, run: dict[str, Any], error: dict[str, Any]) -> bool:
+        """Terminal failure for ordinary runs; a pending switch run is requeued.
+
+        Returns ``True`` when the run was requeued instead of finished.
+        """
+        if not run.get("switch_id"):
+            self.store.finish_run(run["run_id"], "failed", error=error)
+            return False
+        switch = self.store.get_pending_switch(run["org_id"])
+        if switch is None or switch["switch_id"] != run["switch_id"]:
+            self.store.finish_run(run["run_id"], "failed", error=error)
+            return False
+        progress = dict(run.get("progress") or {})
+        attempts = int(progress.get("switch_attempts", 0)) + 1
+        self.store.update_run(run["run_id"], progress={**progress, "switch_attempts": attempts}, error=error)
+        self.store.requeue_run(run["run_id"], reason=error.get("code", "switch_retry"), status="queued")
+        delay = min(5.0, 0.2 * (2 ** min(attempts, 5)))
+        self.stop_event.wait(delay)
+        return True
+
     # ------------------------------------------------------------------
     # full rebuild
+    def _guard_epoch(self, run: dict[str, Any]) -> None:
+        """Raise once the run's source epoch has been replaced."""
+        state = self.store.get_state(run["org_id"])
+        active = int(state["active_epoch"])
+        run_epoch = int(run["source_epoch"])
+        if run.get("switch_id"):
+            switch = self.store.get_pending_switch(run["org_id"])
+            if switch is None or switch["switch_id"] != run["switch_id"]:
+                raise StaleEpoch(run_epoch, active)
+            return
+        if run_epoch != active:
+            raise StaleEpoch(run_epoch, active)
+
+    def _run_adapter(self, rt: OrgRuntime, run: dict[str, Any]):
+        """Adapter for the source a run actually belongs to."""
+        if run.get("switch_id"):
+            switch = self.store.get_switch(run["switch_id"])
+            org = self.store.get_org(run["org_id"])
+            return rt.adapter_for(switch["source"], org.get("options") or {})
+        return None
+
     def _run_full(self, rt: OrgRuntime, run: dict[str, Any]) -> None:
         org_id = run["org_id"]
         run_id = run["run_id"]
+        source_epoch = int(run["source_epoch"])
         restarts = int((run.get("progress") or {}).get("scan_restarts", 0))
         contended = int((run.get("progress") or {}).get("contention_restarts", 0))
         while True:
+            self._guard_epoch(run)
             scan = self.store.find_scan_for_run(run_id)
             if scan is None or scan["status"] in ("interrupted", "failed", "published"):
                 if scan is not None:
                     self.store.delete_scan(scan["scan_id"])
-                scan = self.store.create_scan(org_id, run_id, "full")
+                scan = self.store.create_scan(org_id, run_id, "full", source_epoch=source_epoch)
             self.store.update_run(
                 run_id,
                 phase="listing",
@@ -555,6 +759,8 @@ class Engine:
             try:
                 self._full_attempt(rt, run, scan, contended)
                 return
+            except StaleEpoch:
+                raise
             except RebuildContended:
                 # An incremental window published newer state while this
                 # rebuild was staging.  Restarting from a fresh snapshot is
@@ -580,29 +786,27 @@ class Engine:
                 rt._sleep(0.2 + 0.1 * contended)
                 continue
             except IncompleteCorrection as exc:
+                error = {
+                    "code": "incomplete_correction",
+                    "message": str(exc),
+                    "correction_id": exc.correction_id,
+                    **exc.details,
+                }
                 self.store.mark_scan(scan["scan_id"], "failed", {"message": str(exc), **exc.details})
                 self.store.delete_scan(scan["scan_id"])
-                self.store.finish_run(
-                    run["run_id"],
-                    "failed",
-                    error={
-                        "code": "incomplete_correction",
-                        "message": str(exc),
-                        "correction_id": exc.correction_id,
-                        **exc.details,
-                    },
-                )
+                if self._fail_or_retry_switch(run, error):
+                    return
+                self.store.finish_run(run["run_id"], "failed", error=error)
                 return
             except ScanExpired as exc:
                 restarts += 1
                 self.store.mark_scan(scan["scan_id"], "expired", {"message": str(exc)})
                 self.store.delete_scan(scan["scan_id"])
                 if restarts > 3:
-                    self.store.finish_run(
-                        run_id,
-                        "failed",
-                        error={"code": "snapshot_expired", "message": "catalog snapshot kept expiring"},
-                    )
+                    error = {"code": "snapshot_expired", "message": "catalog snapshot kept expiring"}
+                    if self._fail_or_retry_switch(run, error):
+                        return
+                    self.store.finish_run(run_id, "failed", error=error)
                     return
                 self.store.update_run(
                     run_id,
@@ -617,7 +821,9 @@ class Engine:
         org_id = run["org_id"]
         run_id = run["run_id"]
         scan_id = scan["scan_id"]
+        source_epoch = int(run["source_epoch"])
         attempt = int((run.get("progress") or {}).get("scan_restarts", 0))
+        adapter = self._run_adapter(rt, run)
 
         # 1. list the snapshot -----------------------------------------
         if scan["status"] == "listing":
@@ -627,11 +833,12 @@ class Engine:
             ordinal = scan["entries_done"]
             while True:
                 rt._check_abort()
+                self._guard_epoch(run)
                 try:
                     if first:
-                        page = rt.call(lambda a: a.open_catalog())
+                        page = rt.call(lambda a: a.open_catalog(), adapter=adapter)
                     else:
-                        page = rt.call(lambda a: a.catalog_page(token))
+                        page = rt.call(lambda a, t=token: a.catalog_page(t), adapter=adapter)
                 except ChannelExpired as exc:
                     raise ScanExpired(str(exc)) from exc
                 except NotFound as exc:
@@ -687,8 +894,9 @@ class Engine:
             done = 0
             for cert_no in pending:
                 rt._check_abort()
+                self._guard_epoch(run)
                 try:
-                    detail = rt.call(lambda a, no=cert_no: a.detail(no))
+                    detail = rt.call(lambda a, no=cert_no: a.detail(no), adapter=adapter)
                 except NotFound:
                     self.store.set_scan_item(scan_id, cert_no, status="deleted")
                     continue
@@ -725,7 +933,8 @@ class Engine:
         # 3. catch up and publish --------------------------------------
         while True:
             rt._check_abort()
-            self._catch_up_scan(rt, run, scan)
+            self._guard_epoch(run)
+            self._catch_up_scan(rt, run, scan, adapter=adapter)
             scan = self.store.get_scan(scan_id)
             entries = self._assemble_staged(rt, run, scan)
             watermark_seq = scan["head_seq"]
@@ -739,6 +948,8 @@ class Engine:
                 head_cursor=scan["head_cursor"],
                 head_seq=scan["head_seq"],
                 run_id=run_id,
+                source_epoch=source_epoch,
+                switch_id=run.get("switch_id"),
             )
             if published is not None:
                 self.store.mark_scan(scan_id, "published")
@@ -750,19 +961,30 @@ class Engine:
                         "scan_restarts": attempt,
                         "published_version": published["version"],
                         "cert_count": published["cert_count"],
+                        "active_epoch": published["active_epoch"],
                     },
                 )
                 self.store.finish_run(
                     run_id, "succeeded", cursor_after=scan["head_cursor"] or scan["catchup_cursor"]
                 )
+                if run.get("switch_id"):
+                    # cutover committed: drop adapter caches and retire any
+                    # in-flight work still bound to the previous source
+                    rt.invalidate()
+                    self.store.supersede_runs_for_epoch(org_id, published["active_epoch"])
                 self._reconcile_pending(rt, run)
                 return
+            if run.get("switch_id"):
+                # another cutover already consumed this switch id
+                raise StaleEpoch(source_epoch, self.store.get_state(org_id)["active_epoch"])
             # An incremental run published a newer watermark while this rebuild
             # was staging: staged details are now stale, so the scan restarts
             # from a fresh snapshot instead of overwriting newer content.
             raise RebuildContended("newer catalog version published concurrently")
 
-    def _catch_up_scan(self, rt: OrgRuntime, run: dict[str, Any], scan: dict[str, Any]) -> None:
+    def _catch_up_scan(
+        self, rt: OrgRuntime, run: dict[str, Any], scan: dict[str, Any], *, adapter: Any = None
+    ) -> None:
         scan_id = scan["scan_id"]
         run_id = run["run_id"]
         cursor = scan["catchup_cursor"] or scan["change_position"]
@@ -771,8 +993,11 @@ class Engine:
         batch = int((self.store.get_org(run["org_id"]).get("options") or {}).get("batch_size", 100))
         while True:
             rt._check_abort()
+            self._guard_epoch(run)
             try:
-                page: ChangePage = rt.call(lambda a, c=cursor: a.changes(c, batch))
+                page: ChangePage = rt.call(
+                    lambda a, c=cursor: a.changes(c, batch), adapter=adapter
+                )
             except ChannelExpired:
                 raise ScanExpired("change cursor expired during catch-up")
             except NotFound:
@@ -781,7 +1006,9 @@ class Engine:
             # Details are authoritative current content, so resolving every
             # touched certificate (not trusting the event's order/kind) makes
             # duplicated and reordered events harmless.
-            present, gone = self._stage_details(rt, scan_id, touched, return_status=True)
+            present, gone = self._stage_details(
+                rt, scan_id, touched, return_status=True, adapter=adapter
+            )
             if gone:
                 self.store.mark_scan_items_deleted(scan_id, sorted(gone))
             elif present:
@@ -815,13 +1042,14 @@ class Engine:
         cert_nos: set[str],
         *,
         return_status: bool = False,
+        adapter: Any = None,
     ):
         present: set[str] = set()
         gone: set[str] = set()
         for cert_no in sorted(cert_nos):
             rt._check_abort()
             try:
-                detail = rt.call(lambda a, no=cert_no: a.detail(no))
+                detail = rt.call(lambda a, no=cert_no: a.detail(no), adapter=adapter)
             except NotFound:
                 self.store.set_scan_item(scan_id, cert_no, status="deleted")
                 gone.add(cert_no)
@@ -842,8 +1070,10 @@ class Engine:
         self, rt: OrgRuntime, run: dict[str, Any], scan: dict[str, Any]
     ) -> dict[str, dict[str, Any]]:
         scan_id = scan["scan_id"]
+        adapter = self._run_adapter(rt, run)
         for _ in range(4):
             rt._check_abort()
+            self._guard_epoch(run)
             items = self.store.scan_items(scan_id)
             entries: dict[str, dict[str, Any]] = {}
             for item in items:
@@ -871,7 +1101,7 @@ class Engine:
                     incomplete.append(cid)
             if missing_fetch:
                 # details already staged may be stale; refetch the absent ones
-                fetched_any = self._stage_details_visible(rt, scan_id, missing_fetch)
+                fetched_any = self._stage_details_visible(rt, scan_id, missing_fetch, adapter)
                 if not fetched_any:
                     raise IncompleteCorrection(
                         next(iter(groups), "unknown"), {"missing": sorted(missing_fetch)}
@@ -884,19 +1114,21 @@ class Engine:
                     for m in groups.get(cid, set())
                     if m in entries
                 }
-                if refresh and self._stage_details_visible(rt, scan_id, refresh):
+                if refresh and self._stage_details_visible(rt, scan_id, refresh, adapter):
                     continue
                 raise IncompleteCorrection(incomplete[0], {"incomplete": incomplete})
             # drop correction members that are not published (deleted upstream)
             return entries
         raise IncompleteCorrection("unknown", {"reason": "group never became consistent"})
 
-    def _stage_details_visible(self, rt: OrgRuntime, scan_id: str, cert_nos: set[str]) -> bool:
+    def _stage_details_visible(
+        self, rt: OrgRuntime, scan_id: str, cert_nos: set[str], adapter: Any = None
+    ) -> bool:
         got = False
         for cert_no in sorted(cert_nos):
             rt._check_abort()
             try:
-                detail = rt.call(lambda a, no=cert_no: a.detail(no))
+                detail = rt.call(lambda a, no=cert_no: a.detail(no), adapter=adapter)
             except NotFound:
                 self.store.set_scan_item(scan_id, cert_no, status="deleted")
                 continue
@@ -919,6 +1151,7 @@ class Engine:
                 error={"code": "catalog_not_ready", "message": "full collection has not completed"},
             )
             return
+        self._guard_epoch(run)
         cursor = state["watermark_cursor"]
         if not cursor:
             self._schedule_recovery(org_id, "missing_cursor")
@@ -936,11 +1169,15 @@ class Engine:
         try:
             while True:
                 rt._check_abort()
+                self._guard_epoch(run)
                 page = rt.call(lambda a, c=cursor: a.changes(c, batch))
                 windows += 1
                 total_events += len(page.items)
                 if page.items:
                     self._apply_change_window(rt, run, page)
+                # A source switch may have cut over while the window was being
+                # resolved; stop immediately rather than advancing any cursor.
+                self._guard_epoch(run)
                 cursor = page.next_cursor
                 seq = page.next_seq if page.next_seq is not None else page.head_seq
                 self.store.update_run(
@@ -957,6 +1194,8 @@ class Engine:
                     break
             self.store.finish_run(run_id, "succeeded", cursor_after=cursor)
             self._reconcile_pending(rt, run)
+        except StaleEpoch:
+            raise
         except ChannelExpired:
             self._schedule_recovery(org_id, "cursor_expired")
             self.store.finish_run(
@@ -1016,9 +1255,13 @@ class Engine:
             watermark_seq=max(watermark_seq, state["watermark_seq"]),
             head_cursor=page.next_cursor,
             head_seq=int(page.head_seq or watermark_seq),
+            source_epoch=int(run["source_epoch"]),
         )
         if published is None:
-            # a rebuild published newer state in the meantime; next cycle re-reads
+            # a rebuild published newer state in the meantime (or the source was
+            # switched); next cycle re-reads from the current watermark
+            if int(run["source_epoch"]) != int(state["active_epoch"]):
+                raise StaleEpoch(int(run["source_epoch"]), int(state["active_epoch"]))
             return
         for group in held:
             if not group.get("held"):
@@ -1189,6 +1432,7 @@ class Engine:
                 watermark_seq=state["watermark_seq"],
                 head_cursor=state["source_head_cursor"],
                 head_seq=state["source_head_seq"],
+                source_epoch=int(state["active_epoch"]),
             )
             if published is None:
                 continue
@@ -1196,6 +1440,10 @@ class Engine:
 
     def _schedule_recovery(self, org_id: str, reason: str) -> None:
         if self.store.has_active_run(org_id, (FULL,)):
+            return
+        if self.store.get_pending_switch(org_id) is not None:
+            # the switch run is itself the recovery; do not queue a rebuild of
+            # the old source on top of it
             return
         self.store.create_run(
             org_id, FULL, f"recovery:{reason}", coalesce_incremental=False

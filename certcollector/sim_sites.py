@@ -61,6 +61,13 @@ class HtmlSite:
         method = request["method"]
         path = request["path"]
         query = request["query"]
+        # admin controls stay reachable while the body is otherwise offline,
+        # otherwise there would be no way to bring it back
+        if path.startswith("/__admin/"):
+            try:
+                return self._admin(method, path, query, request.get("body"))
+            except WorldError as exc:
+                return _error(exc)
         guard = self.world.acquire()
         if guard[0] is not None:
             status, retry, _ = guard
@@ -96,8 +103,6 @@ class HtmlSite:
                 return self._detail(cert_no, query)
             if path == "/changes":
                 return self._changes(query)
-            if path.startswith("/__admin/"):
-                return self._admin(method, path, query, request.get("body"))
             return _html_response(404, "<h1>not found</h1>")
         except WorldError as exc:
             return _error(exc)
@@ -195,6 +200,10 @@ class HtmlSite:
         if action == "expire":
             self.world.expire_all()
             return _json_response(200, {"expired": True})
+        if action == "enable":
+            return _json_response(200, self.world.set_enabled(True))
+        if action == "disable":
+            return _json_response(200, self.world.set_enabled(False))
         if action == "update":
             data = json.loads(body or "{}")
             return _json_response(200, self.world.update_config(data))
@@ -217,6 +226,12 @@ class JsonSite:
         method = request["method"]
         path = request["path"]
         query = request["query"]
+        # admin controls stay reachable while the body is otherwise offline
+        if path.startswith("/__admin/"):
+            try:
+                return self._admin(method, path, body=request.get("body"))
+            except WorldError as exc:
+                return _error(exc)
         guard = self.world.acquire()
         if guard[0] is not None:
             status, retry, _ = guard
@@ -250,8 +265,6 @@ class JsonSite:
                 return self._detail(cert_no, query)
             if path == "/api/v1/changes":
                 return self._changes(query)
-            if path.startswith("/__admin/"):
-                return self._admin(method, path, body=request.get("body"))
             return _json_response(404, {"error": "not_found"})
         except WorldError as exc:
             return _error(exc)
@@ -315,6 +328,10 @@ class JsonSite:
         if action == "expire":
             self.world.expire_all()
             return _json_response(200, {"expired": True})
+        if action == "enable":
+            return _json_response(200, self.world.set_enabled(True))
+        if action == "disable":
+            return _json_response(200, self.world.set_enabled(False))
         if action == "update":
             data = json.loads(body or "{}")
             return _json_response(200, self.world.update_config(data))

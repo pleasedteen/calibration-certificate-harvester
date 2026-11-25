@@ -5,8 +5,11 @@ bodies into a local, queryable catalog. It supports organization configuration,
 full and incremental collection, online rebuilds, pause/resume, certificate
 queries, paged exports and progress reporting.
 
-The repository ships two simulated upstream bodies, so nothing here ever talks
-to a real external site.
+The repository ships simulated upstream bodies, so nothing here ever talks
+to a real external site: two regular bodies (HTML and JSON) plus a smaller,
+independently sequenced `alt` body (`/alt`) used to exercise source switching.
+Each body exposes `/__admin/enable`, `/__admin/disable`, `/__admin/expire` and
+configuration helpers for the tests.
 
 ```
 certcollector/
@@ -105,7 +108,7 @@ rate budget.
 
 | method | path | purpose |
 | --- | --- | --- |
-| `POST` | `/api/orgs` | create/update organization |
+| `POST` | `/api/orgs` | create/update organization (a changed `source` starts an online switch) |
 | `GET` | `/api/orgs` | list organizations |
 | `GET` | `/api/orgs/{org}` | organization + catalog state |
 | `POST` | `/api/orgs/{org}/collect` | `{"mode":"auto\|full\|incremental"}` |
@@ -113,6 +116,7 @@ rate budget.
 | `POST` | `/api/orgs/{org}/pause` / `resume` | pause / resume |
 | `GET` | `/api/orgs/{org}/status` | phase, progress, wait and failure reasons |
 | `GET` | `/api/orgs/{org}/runs[/{run}]` | run history and detail |
+| `GET` | `/api/orgs/{org}/switches[/{id}]` | source-switch history and detail |
 | `GET` | `/api/orgs/{org}/certs?page=&page_size=&status=` | paged certificates |
 | `GET` | `/api/orgs/{org}/certs/{cert}` | certificate detail (incl. correction) |
 | `GET` | `/api/orgs/{org}/corrections` | corrections not yet fully applied |
@@ -131,6 +135,22 @@ rate budget.
   it in one transaction only after listing, detail fetching and catch-up have
   all succeeded. A failed scan never touches the published catalog, and
   certificates missing from the new snapshot leave the catalog.
+* **Source switching is an online cutover.** Re-posting an organization with a
+  different `source` (`POST /api/orgs`, HTTP `202`) starts a switch instead of
+  disturbing the running catalog. Until the cutover commits, the old catalog
+  and the old incremental channel keep serving the previous source. A full
+  scan of the new source then replaces the certificate set, the watermark and
+  the continuation position *and* swaps the active source in one transaction,
+  so the new catalog and its resume position always take effect together.
+  Sequence numbers and revisions are not comparable across bodies: a new source
+  with smaller sequence numbers, or a shared certificate at a lower revision,
+  is still accepted. Every run, scan and write carries a source-epoch label;
+  results that arrive late from the old source are rejected at the write
+  boundary and can never touch the new catalog or the old continuation
+  position. A switch whose target is temporarily unavailable stays pending
+  (the old source keeps serving) and retries with back-off until the body
+  recovers; the pending switch is durable and resumes itself after a restart.
+  A second switch while one is pending is rejected with `409`.
 * **Corrections are all-or-nothing.** A formal correction that revokes an old
   certificate and publishes several replacements is only applied once every
   member is resolvable; the group (from the detail pages) is published in one
@@ -143,9 +163,10 @@ rate budget.
   restarts the affected scan automatically (bounded retries) and the catalog
   converges again.
 * **Consistent exports.** An export materializes one published catalog version;
-  every page of that token stays on that version while collection and rebuilds
-  continue. Credentials survive a service restart, resume by page, and are
-  rejected with `410` after expiry.
+  every page of that token stays on that version while collection, rebuilds and
+  source switches continue. An export created before a switch keeps paging
+  through the frozen pre-switch catalog after the cutover. Credentials survive
+  a service restart, resume by page, and are rejected with `410` after expiry.
 * **Bounded history.** Expired export rows are pruned immediately and finished
   runs are pruned beyond the configured keep count; a small export tombstone is
   retained only long enough to keep the expiry answer explicit.
